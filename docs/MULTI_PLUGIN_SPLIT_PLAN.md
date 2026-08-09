@@ -1,9 +1,9 @@
 # FugsMultiTrackAudioEX — Multi-Plugin Split Plan
 
-**Status:** Phase 5 complete; docs playbook → `FugsAudio0Docs` (production). Remaining Phase 6: README + rename polish.  
+**Status:** **DONE** (Phases 1–6 + B01–B16 + save/load extensions + soft-transition bundle). Remaining: optional in-game `test('play')` on a real MV project.  
 **Source:** Core + Docs + Effects + Spatial + Dynamics + Switch + Aliases + Compat + Test  
 **Goal:** Split the monolith into readable, independently loadable RPG Maker MV plugins without breaking gameplay, save data, or the existing `FugsAudio` / plugin-command APIs.  
-**Last review:** 2026-08-07 — Docs plugin extracted; satellite `@help` slimmed.
+**Last review:** 2026-08-09 — `node scripts/verify-all.js` green (syntax + 50 modular smoke + 11 bundle smoke).
 
 ---
 
@@ -498,13 +498,13 @@ Core `play` must call `FugsAudio.tryPlayAlias?.(…)` (or similar) so Aliases ca
 
 **Exit criteria:** Full parity with current monolith when all plugins enabled in correct order. **Met 2026-08-07.**
 
-### Phase 6 — Docs & DX (partially done)
+### Phase 6 — Docs & DX ✅ DONE (rename/bundle optional)
 
 1. ~~Full playbook → `FugsAudio0Docs.js`; slim `@help` on Core + satellites~~ **done**
-2. Rewrite root README for v2.2 multi-plugin layout (still open).
-3. Example Plugin Manager screenshot / load-order snippet (still open).
-4. Deprecation note: single-file bundle vs Core rename (decision in §10; still open).
-5. Optional: trim outdated “DEV/sources/…” paths inside Docs playbook.
+2. ~~Rewrite root README for v2.2 multi-plugin layout~~ **done**
+3. ~~Load-order snippet in README + Docs `@help`~~ **done** (screenshot optional)
+4. Soft-transition: keep `FugsMultiTrackAudioEX.js` as modular Core + dual-read params; concatenated bundle via `node scripts/build-bundle.js` → `dist/FugsMultiTrackAudioEX.bundle.js` **done**
+5. ~~Trim outdated “DEV/sources/…” paths inside Docs playbook~~ **done**
 
 ---
 
@@ -528,43 +528,46 @@ Core `play` must call `FugsAudio.tryPlayAlias?.(…)` (or similar) so Aliases ca
 
 ## 9. Smoke / Acceptance Checklist
 
-Run after each phase with **all Fugs plugins enabled**, then re-check **Core-only**.
+Offline gate: `node scripts/verify-all.js` (syntax + modular smoke + bundle).  
+In-game items still need a real MV project (ear-check / scene transitions).
 
 ### Core-only
 
-- [ ] `play-bgm1 Theme` / `fade-bgm1 0 2` / `stop-bgm1`
-- [ ] `crossfade-bgm1 Battle 3`
-- [ ] `syncplay-bgm A B C` (if stems available)
-- [ ] Map → menu → battle persistence/pause defaults behave
-- [ ] Save / load restores expected tracks
-- [ ] `FugsAudio.play(...)` script API works
-- [ ] Effect / proximity / duck commands no-op or warn cleanly (not crash)
+- [x] `play` / `fade` / `stop` dispatch — Node smoke (`accept play/fade/stop`)
+- [ ] `crossfade-bgm1 Battle 3` — in-game
+- [ ] `syncplay-bgm A B C` (if stems available) — in-game
+- [x] Pause / resume path — Node smoke (+ B01/B03/B04/B16 unit coverage earlier)
+- [x] Save / load restores tracks + spatial/dynamics meta — Node smoke (B06/B12)
+- [x] `FugsAudio` hub / `executeCommand` — Node smoke
+- [x] Effect / proximity / duck soft-stubs when satellites absent — verified at split; modular smoke loads full pack
 
 ### With Effects
 
-- [ ] `effect-bgm1 preset:cave`
-- [ ] `fadeouteffect-bgm1 2`
-- [ ] `cleareffect-bgm1`
-- [ ] Stop track cleans effect nodes (no audible ghost / console errors)
+- [x] Effect handler registered when Effects loaded — Node smoke
+- [ ] `effect-bgm1 preset:cave` audible path — in-game
+- [ ] `fadeouteffect` / `cleareffect` — in-game
+- [x] Stop/teardown cleans effect chains via hooks — wired; covered by teardown hook count smoke
 
 ### With Spatial
 
-- [ ] `proximity-bgs1 {event:N, maxDistance:10}`
-- [ ] Doppler optional path
-- [ ] Pan sweep start/stop
+- [x] Proximity setup + every-frame update (B05/B14) — code + smoke restore
+- [x] Pan sweep start/stop + save/restore — Node smoke
+- [ ] Doppler audible path — in-game
 
 ### With Dynamics
 
-- [ ] `duckall 0.3 0.5 2`
-- [ ] `duckpump 120 0.5 sine all` / `stoppump`
-- [ ] Sidechain start/stop between two BGM tracks
+- [x] Duck / sidechain / pitchbend handlers — Node smoke
+- [x] Sidechain replace + envelope timing (B07/B11) — code + smoke
+- [x] Pump save/restore via `__fugsMeta` — Node smoke
+- [ ] `duckpump` audible path — in-game
 
 ### With Switch / Aliases / Compat / Test
 
-- [ ] Switch-gated command queues and restores
-- [ ] Alias register + play
-- [ ] OcRam project: no `fadeOutBgs` recursion
-- [ ] `test('?')` and a small subset (`test('play')`) pass
+- [x] SwitchBuffer attached when Switch loaded — Node smoke
+- [x] Alias register + play — Node smoke
+- [x] Compat loads idle without OcRam — Node smoke (full pack load)
+- [x] `FugsAudio8Test` loads (`test` global) — Node smoke
+- [ ] `await test('play')` in a real MV project — in-game
 
 ---
 
@@ -666,19 +669,20 @@ MV projects copy these into `js/plugins/`. Keep the numbers so Plugin Manager fi
 | Prerequisite for feature split | Handler + lifecycle registry | Phase 2 |
 | Public API | Keep `FugsAudio.*` names | No breaking renames |
 | Bundle strategy | Soft transition (Option A) preferred | Finalize at Phase 6 |
-| README | Out of date (v1.0) | Update in Phase 6 / sooner if useful |
+| README | v2.2 multi-plugin | **Phase 6 done** |
 | Switch absent + `switch:N` | warn + execute immediately | Implemented in Phase 2 plugin-command path |
+| Core filename | Keep `FugsMultiTrackAudioEX.js` | Dual-read already supports future `FugsAudio1Core` |
 
 ---
 
 ## 13. Immediate Next Actions
 
-1. ~~**Phase 1:** Extract `FugsAudio8Test.js`~~ **done**
-2. ~~**Phase 2:** Introduce `registerHandler` + teardown/update hooks inside the monolith~~ **done**
-3. ~~**Phase 3:** Extract `FugsAudio2Effects.js`~~ **done**
-4. ~~**Phase 4:** Extract `FugsAudio3Spatial.js` + `FugsAudio4Dynamics.js`~~ **done**
-5. ~~**Phase 5:** Extract Switch + Aliases + Compat~~ **done**
-6. **Phase 6:** Docs & DX — root README, per-plugin `@help` trim, optional rename to `FugsAudio1Core.js`, soft-transition bundle decision.
+1. ~~Phases 1–6~~ **done**
+2. ~~B01–B16~~ **done**
+3. ~~Proximity / panSweep / sidechain / pump save-restore~~ **done** (`ext.*` + `__fugsMeta`)
+4. ~~Soft-transition bundle~~ **done** — `node scripts/build-bundle.js` → `dist/FugsMultiTrackAudioEX.bundle.js`
+5. ~~Offline verify gate~~ **done** — `node scripts/verify-all.js`
+6. **Only remaining (needs your MV project):** enable pack + `FugsAudio8Test` → `await test('play')` and listen through menu/battle/save.
 
 Plugin Manager (production):
 

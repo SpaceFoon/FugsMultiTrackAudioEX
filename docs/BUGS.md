@@ -1,10 +1,12 @@
 # FugsMultiTrackAudioEX — Known Bugs
 
 **Source:** `FugsMultiTrackAudioEX.js`  
-**Last updated:** 2026-07-16  
-**Status legend:** Open · Confirmed in code · Fix not applied
+**Last updated:** 2026-08-09  
+**Status legend:** Open · Fixed · Confirmed in code · Fix not applied
 
 This file tracks confirmed defects found by code review. Severity reflects user impact under default or common setups.
+
+> **Status (2026-08-09):** All 16 confirmed bugs (B01–B16) are fixed. Each was verified with isolated Node smoke tests simulating the RPG Maker MV audio environment. Fixes span the core (`FugsMultiTrackAudioEX.js`) and the `FugsAudio2Effects` / `FugsAudio3Spatial` / `FugsAudio4Dynamics` satellites.
 
 ---
 
@@ -12,80 +14,74 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 
 | ID | Severity | Title | Status |
 |----|----------|-------|--------|
-| B01 | Critical | Battle auto-pause never resumes | Open |
-| B02 | High | Plugin commands drop `(loop:…)` | Open |
-| B03 | High | Re-pausing wipes saved seek position | Open |
-| B04 | High | Resume of one-shot tracks never re-arms end cleanup | Open |
-| B05 | High | Event-bound proximity frozen while player stands still | Open |
-| B06 | High | Save/load drops proximity (and related spatial state) | Open |
-| B07 | High | Re-calling `sidechain` leaks old connections | Open |
-| B08 | Medium | FadeManager can double-fire `onComplete` | Open |
-| B09 | Medium | `cleanupOrphanedTracks` drops buffers without release/stop | Open |
-| B10 | Medium | Effect crossfade half-duration race | Open |
-| B11 | Medium | Sidechain attack/release times wrong (~sampleRate vs frame) | Open |
-| B12 | Medium | Paused save restore can blip or lose seek position | Open |
-| B13 | Medium | Per-type “all” commands hit paused tracks; global “all” skips them | Open |
-| B14 | Medium | Proximity gated on tile coords, not smooth movement | Open |
-| B15 | Low–Medium | Manual resume doesn’t refresh proximity volume | Open |
-| B16 | Low | Pause-with-fadeout blocks resume until timeout | Open |
+| B01 | Critical | Battle auto-pause never resumes | **Fixed** |
+| B02 | High | Plugin commands drop `(loop:…)` | **Fixed** |
+| B03 | High | Re-pausing wipes saved seek position | **Fixed** |
+| B04 | High | Resume of one-shot tracks never re-arms end cleanup | **Fixed** |
+| B05 | High | Event-bound proximity frozen while player stands still | **Fixed** |
+| B06 | High | Save/load drops proximity (and related spatial state) | **Fixed** |
+| B07 | High | Re-calling `sidechain` leaks old connections | **Fixed** |
+| B08 | Medium | FadeManager can double-fire `onComplete` | **Fixed** |
+| B09 | Medium | `cleanupOrphanedTracks` drops buffers without release/stop | **Fixed** |
+| B10 | Medium | Effect crossfade half-duration race | **Fixed** |
+| B11 | Medium | Sidechain attack/release times wrong (~sampleRate vs frame) | **Fixed** |
+| B12 | Medium | Paused save restore can blip or lose seek position | **Fixed** |
+| B13 | Medium | Per-type “all” commands hit paused tracks; global “all” skips them | **Fixed** |
+| B14 | Medium | Proximity gated on tile coords, not smooth movement | **Fixed** |
+| B15 | Low–Medium | Manual resume doesn’t refresh proximity volume | **Fixed** |
+| B16 | Low | Pause-with-fadeout blocks resume until timeout | **Fixed** |
 
 ---
 
 ## Confirmed bugs
 
-### B01 — Critical: Battle auto-pause never resumes
+### B01 — Critical: Battle auto-pause never resumes — **FIXED 2026-08-09**
 
-**Where:** `Scene_Battle.prototype.terminate` (~7978–7984), `Scene_Menu.prototype.terminate` (~7997–8011), `handleSceneTransition` (~7034–7097); defaults ~1069–1070 / `@param` ~58–62
+**Where:** `Scene_Battle.prototype.terminate`, `Scene_Menu.prototype.terminate`, `handleSceneTransition`
 
-**What’s wrong:** Default `pauseMode: battle` pauses tracks on battle enter, but battle exit never resumes them. Menu has an explicit resume path; battle only calls `handleSceneTransition("scene")`, which neither resumes nor stops paused tracks.
+**What was wrong:** Default `pauseMode: battle` paused tracks on battle enter, but battle exit never resumed them.
 
-**Triggers:** Play BGM with defaults → enter battle → leave battle. Track stays in `pausedTracks` (silent).
-
-**Suggested fix:** On battle→map (and/or map create after battle), resume tracks with `_pauseMode === "battle"` (mirror menu terminate).
+**Fix:** Battle→map terminate now resumes `_pauseMode === "battle"` tracks (mirrors menu), then runs `handleSceneTransition("scene")`.
 
 ---
 
-### B02 — High: Plugin commands drop `(loop:…)`
+### B02 — High: Plugin commands drop `(loop:…)` — **FIXED**
 
-**Where:** `Game_Interpreter.prototype.pluginCommand` `commandObj` (~8069–8079) vs `parseClassicSyntax` / `checkLoop` (~6905–6916) and `testCommand` (~7429–7436)
+**Where:** `Game_Interpreter.prototype.pluginCommand` `commandObj`
 
-**What’s wrong:** Parsing returns `loop`, and `executeCommand` / `playAudio` honor it, but the live plugin-command path never copies `loop` into `commandObj`. `FugsAudio.testCommand()` does include it — console/script works, event Plugin Commands don’t.
+**What was wrong:** Parsing returned `loop`, but the live plugin-command path never copied it into `commandObj`.
 
-**Triggers:** `play-se1 Hit (loop:3)` (or any `(loop:N|forever|never)`) from a Plugin Command → always uses type defaults (SE once, BGM forever).
-
-**Suggested fix:** Add `loop: parsed.loop` to `commandObj` (and keep it on switch-buffered commands).
+**Fix:** `commandObj` now includes `loop: parsed.loop` (and `effect`).
 
 ---
 
-### B03 — High: Re-pausing wipes saved seek position
+### B03 — High: Re-pausing wipes saved seek position — **FIXED 2026-08-09**
 
-**Where:** `pauseAudio` (~5354–5470)
+**Where:** `pauseAudio`
 
-**What’s wrong:** No “already paused” guard. A second pause calls `buffer.seek()` on a stopped buffer (often `0`) and overwrites `pausedSnapshots`.
+**What was wrong:** No “already paused” guard. A second pause called `buffer.seek()` on a stopped buffer (often `0`) and overwrote `pausedSnapshots`.
 
-**Triggers:** Manual `pause` then enter battle with `pauseMode: battle`; or any double pause. Resume restarts from 0.
-
-**Suggested fix:** Early-return if `pausedTracks.has(key)`; or don’t overwrite snapshot when already paused.
+**Fix:** Early-return if `pausedTracks.has(key)` (keeps snapshot). Works with B16 immediate pause marking.
 
 ---
 
-### B04 — High: Resume of one-shot tracks never re-arms end cleanup
+### B04 — High: Resume of one-shot tracks never re-arms end cleanup — **FIXED 2026-08-09**
 
-**Where:** `resumeAudio` forever/never path (~5558–5655) vs `playAudio` `scheduleEndAction` (~4227–4293); pause clears timeouts (~5410–5416)
+**Where:** `resumeAudio` / `playAudio` end timers
 
-**What’s wrong:** Pause cancels end timers. Resume recreates the buffer and plays, but only the `repeat` path goes through `playAudio` (which reschedules). `never` (SE/ME) and similar finish with no auto-cleanup → stale entries in `tracks`.
+**What was wrong:** Pause cancelled end timers; resume recreate path didn’t re-arm them for `never` one-shots.
 
-**Triggers:** Pause a one-shot mid-play → resume → let it finish. Track remains registered.
-
-**Suggested fix:** After resume `play()`, call the same end-scheduling logic used in `playAudio` for non-forever modes.
+**Fix:** Shared `_scheduleTrackEndAction()` used by `playAudio` and both resume paths (recreate + in-progress pause cancel).
 
 ---
 
-### B05 — High: Event-bound proximity frozen while player stands still
+### B05 — High: Event-bound proximity frozen while player stands still — **FIXED 2026-08-09**
 
-**Where:** `Scene_Map.update` (~7944–7959), `updateProximityVolume` (~6324–6500)
+**Where:** `FugsAudio3Spatial.js` `onUpdate` hook, `updateProximityVolume`
 
-**What’s wrong:** Proximity only updates when `$gamePlayer.x` / `$gamePlayer.y` (tile coords) change. Event-following sources use event `_realX`/`_realY`, but that logic never runs if the player doesn’t change tiles.
+**What was wrong:** Proximity only updated when `$gamePlayer.x` / `$gamePlayer.y` (tile coords) changed. Event-following sources use event `_realX`/`_realY`, but that logic never ran if the player didn't change tiles.
+
+**Fix:** The Spatial `onUpdate` hook now calls `updateProximityVolume()` every frame while `proximityData.size > 0`. That function already has a per-key `_realX`/`_realY` dirty check (and always recomputes for doppler), so idle frames stay cheap while event-follow and sub-tile movement update smoothly (also resolves B14).
 
 **Triggers:** `proximity-bgm1 {event:5,...}` (or doppler); stand still; move the event toward/away. Volume/pan stay frozen until the player moves.
 
@@ -93,135 +89,131 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 
 ---
 
-### B06 — High: Save/load drops proximity (and related spatial state)
+### B06 — High: Save/load drops proximity (and related spatial state) — **FIXED 2026-08-09**
 
-**Where:** `captureTrackState` / `getSaveData` (~6604–6694, ~6765–6791), `loadTrackState` (~6710–6746), DataManager hooks (~8018–8040)
+**Where:** `captureTrackState` / `loadTrackState` (core), new `_runCaptureHooks` / `_runRestoreHooks`, `FugsAudio3Spatial.js` capture/restore hooks
 
-**What’s wrong:** Saved state is mixer-only. `proximityData` (and pan sweeps, sidechain links, pump state) are never serialized. Restore only `playAudio()` + optional `pauseAudio()` — no proximity re-bind.
+**What was wrong:** Saved state was mixer-only. `proximityData` was never serialized, and restore just did `playAudio()` (+ optional pause) with no spatial re-bind.
+
+**Fix:** The extension contract's capture/restore hooks are now wired. `captureTrackState` attaches `state.ext = _runCaptureHooks(key)`; `loadTrackState` calls `_runRestoreHooks(key, state.ext)` after the track is recreated. Spatial persists `ext.proximity` + `ext.panSweep`; Dynamics persists `ext.sidechains` (on both source and target keys). Active pump is stored in reserved save key `__fugsMeta` via global capture/restore hooks. `loadAllStates` runs a second per-track restore pass, then applies `__fugsMeta`. Transient runtime fields are reset; pan sweeps restart via `startPanSweep`.
 
 **Triggers:** Set proximity → save → load (or `saveall`/`loadall`). Track plays at wrong volume/pan; spatial behavior is gone.
 
-**Suggested fix:** Persist per-key proximity config; on restore call `setupProximitySource()` and refresh volume once.
-
 ---
 
-### B07 — High: Re-calling `sidechain` leaks old connections
+### B07 — High: Re-calling `sidechain` leaks old connections — **FIXED 2026-08-09**
 
-**Where:** `setupSidechain` (~4534–4658)
+**Where:** `FugsAudio4Dynamics.js` `setupSidechain`
 
-**What’s wrong:** Always creates a new analyser + RAF loop and `sidechainConnections.set(...)` without disposing an existing entry for the same `sourceId_to_targetId`. Old RAF/analyser keep running.
+**What was wrong:** Always created a new analyser + RAF loop and `sidechainConnections.set(...)` without disposing an existing entry for the same `sourceId_to_targetId`. Old RAF/analyser kept running.
+
+**Fix:** Before storing the new connection, if one already exists for `connectionKey` it is disposed via `_disposeSidechainConnection(..., { restoreTarget: false })` (cancels its RAF, disconnects the analyser tap, deletes the map entry). `restoreTarget: false` avoids a gain blip since the new follower immediately drives the target.
 
 **Triggers:** Run `sidechain-bgm 1 2 ...` twice with the same source/target. Multiple envelope loops fight over target gain; Web Audio nodes leak.
 
-**Suggested fix:** If `this.sidechainConnections.has(connectionKey)`, call `_disposeSidechainConnection()` first.
-
 ---
 
-### B08 — Medium: FadeManager can double-fire `onComplete`
+### B08 — Medium: FadeManager can double-fire `onComplete` — **FIXED 2026-08-09**
 
-**Where:** `FadeManager.update` / `_watchdog` (~2766–2812)
+**Where:** `FadeManager.update`
 
-**What’s wrong:** RAF and the 100ms watchdog can both run `update()` before fades are deleted → `onComplete` twice (duck restore, multi-param fades, chained callbacks).
+**What was wrong:** RAF and the 100ms watchdog could both run `update()`, and `onComplete` fired while the fade was still in `activeFades` (deletion happened after the loop). A re-entrant `update()` — or an `onComplete` that synchronously drove another fade — could fire the same completion twice.
+
+**Fix:** Each fade now carries its `key`. In `update()`, completed fades are marked `_completed`, then **removed from `activeFades` before** any `onComplete` runs; the loop also skips `_completed` fades. A re-entrant `update()` can no longer observe or re-fire a finished fade.
 
 **Triggers:** Tab backgrounded / RAF stall near fade end; heavy GC.
 
-**Suggested fix:** Mark fade completed before calling `onComplete`, or skip if key already removed; serialize watchdog vs RAF.
-
 ---
 
-### B09 — Medium: `cleanupOrphanedTracks` drops buffers without release/stop
+### B09 — Medium: `cleanupOrphanedTracks` drops buffers without release/stop — **FIXED 2026-08-09**
 
-**Where:** `cleanupOrphanedTracks` (~7100–7127)
+**Where:** `cleanupOrphanedTracks`, new `_stopBufferSafely` helper
 
-**What’s wrong:** “Dead” tracks get `cleanupTrack` only — no `buffer.stop()` / `_releaseBuffer()`. Runs on every scene transition.
+**What was wrong:** “Dead”/corrupted tracks got `cleanupTrack()` only — which tears down maps/fades/effects but never calls `buffer.stop()` or `_releaseBuffer()`. A still-playing (or spuriously not-playing) buffer kept its decoded PCM + WebAudio nodes alive until GC, on every scene transition.
+
+**Fix:** Both the orphaned and corrupted branches now `_stopBufferSafely(buffer)` → `cleanupTrack(key)` → `_releaseBuffer(buffer)`. `_stopBufferSafely` guards against missing/already-stopped `stop()`.
 
 **Triggers:** Finished SE still mapped with `isPlaying() === false`; spurious `isPlaying` false mid-gap.
 
-**Suggested fix:** Stop + `_releaseBuffer` before dropping; be stricter about what counts as orphaned.
+---
+
+### B10 — Medium: Effect crossfade half-duration race — **FIXED 2026-08-09**
+
+**Where:** `FugsAudio2Effects.js` `crossFadeEffect`, `applyEffect`
+
+**What was wrong:** The fade-out cleanup timeout and the mid-point `fadeEffect` both targeted the same key/`effectChains` entry. `fadeOutEffect`'s cleanup already guards on chain identity (so the intra-crossfade ordering was safe), but **interleaved** crossfades / a plain `effect` command mid-crossfade could let a stale mid-point timeout clobber the newer chain.
+
+**Fix:** Added a per-key generation token (`_effectCrossfadeGen`). `crossFadeEffect` bumps it at start and its mid-point timeout aborts if the token changed; `applyEffect` also bumps it so any direct effect apply supersedes a pending crossfade.
+
+**Triggers:** `crossfadeEffects` / effect crossfade under load or with short durations, or a new effect issued during a crossfade.
 
 ---
 
-### B10 — Medium: Effect crossfade half-duration race
+### B11 — Medium: Sidechain attack/release times wrong (~sampleRate vs frame) — **FIXED 2026-08-09**
 
-**Where:** `crossFadeEffect` (~6153–6205); comments at ~6173–6180 already note the race
+**Where:** `FugsAudio4Dynamics.js` `setupSidechain` envelope coeffs
 
-**What’s wrong:** Fade-out cleanup timeout and mid-point `fadeEffect` both target the same key/`effectChains` entry; order can clear or replace the wrong chain.
+**What was wrong:** Envelope smoothing ran in a RAF callback (~60 Hz) but used `Math.exp(-1 / (attack * context.sampleRate))`. `sampleRate` is per-sample, not per-frame, so attack/release behaved like multi-second envelopes instead of documented seconds.
 
-**Triggers:** `crossfadeEffects` / effect crossfade under load or with short durations.
-
-**Suggested fix:** Single sequenced state machine (generation token); don’t rely on two independent timers.
-
----
-
-### B11 — Medium: Sidechain attack/release times wrong (~sampleRate vs frame)
-
-**Where:** `setupSidechain` envelope coeffs (~4600–4610)
-
-**What’s wrong:** Envelope smoothing runs in a RAF callback (~60 Hz) but uses `Math.exp(-1 / (attack * context.sampleRate))`. `sampleRate` is per-sample, not per-frame, so attack/release behave like multi-second envelopes instead of documented seconds.
+**Fix:** Coeffs now use the real frame delta: `dt = clamp(now - lastFrameTime, 0.001, 0.1)` (first frame `1/60`), then `attackCoeff = Math.exp(-dt / attack)` (same for release). Attack/release args now behave as documented seconds.
 
 **Triggers:** `sidechain-bgm 1 2 0.5 4 0.01 0.1` — ducking/release is sluggish regardless of attack/release args.
 
-**Suggested fix:** Use frame delta (`Math.exp(-dt / attack)` with `dt ≈ 1/60`), or drive the follower with `AudioParam.setTargetAtTime`.
-
 ---
 
-### B12 — Medium: Paused save restore can blip or lose seek position
+### B12 — Medium: Paused save restore can blip or lose seek position — **FIXED 2026-08-09**
 
-**Where:** `loadTrackState` (~6710–6740), `playAudio` (~4111–4332), `pauseAudio` (~5354–5468)
+**Where:** `loadTrackState` → new `_restorePausedTrack` (core)
 
-**What’s wrong:** Restore calls `playAudio()` then immediately `pauseAudio([0])` with no wait for decode/load. `seek()` may still be 0; playback may audibly start before stop.
+**What was wrong:** Restore called `playAudio()` then immediately `pauseAudio([0])` with no wait for decode/load. On a cold buffer `seek()` returned 0 (losing position) and playback could audibly start before the stop.
+
+**Fix:** Paused restore now goes through `_restorePausedTrack`: if the buffer isn't ready it defers the pause via `addLoadListener` (so nothing plays before it's stopped), and after pausing it overwrites the snapshot position (`snap.pos` / `buffer._pausedPos`) with the authoritative saved `state.currentTime` instead of trusting `seek()`.
 
 **Triggers:** Save while paused mid-song → load on slow/cold cache. Brief audio blip and/or wrong resume position.
 
-**Suggested fix:** Load-aware restore path: wait for `isReady()` / load listener, seek to `state.currentTime`, then stop and snapshot.
-
 ---
 
-### B13 — Medium: Per-type “all” commands hit paused tracks; global “all” skips them
+### B13 — Medium: Per-type “all” commands hit paused tracks; global “all” skips them — **FIXED 2026-08-09**
 
-**Where:** `fadeAllAudio` / `duckAllAudio` (~4973–5036, ~5138–5155) vs `fadeAllOfType` / `duckAllOfType` / `pitchBendAll*` (~5005–5036, ~5217–5248)
+**Where:** `fadeAllOfType` (core), `duckAllOfType` / `pitchBendAll` / `pitchBendAllOfType` (`FugsAudio4Dynamics.js`)
 
-**What’s wrong:** Global fade/duck skip `pausedTracks`. Per-type and pitch-bend-all paths do not. Changes apply to the stopped buffer, not `pausedSnapshots`, so resume restores pre-pause values.
+**What was wrong:** Global `fadeAllAudio` / `duckAllAudio` skip `pausedTracks`, but the per-type paths and `pitchBendAll*` did not. Changes applied to the stopped buffer (not `pausedSnapshots`), so resume restored pre-pause values.
+
+**Fix:** Added the same `if (this.pausedTracks && this.pausedTracks.has(key)) continue;` guard to `fadeAllOfType`, `duckAllOfType`, `pitchBendAll`, and `pitchBendAllOfType`, matching the global paths.
 
 **Triggers:** Auto-pause BGM → `fadeall-bgm 30 2` or `duckall-bgm 0.3 1 2` → resume. Volume unchanged from snapshot; duck appeared to do nothing.
 
-**Suggested fix:** Skip `pausedTracks` (or update snapshots when intentionally modifying paused tracks) in all `*AllOfType` / `pitchBendAll*` paths.
-
 ---
 
-### B14 — Medium: Proximity gated on tile coords, not smooth movement
+### B14 — Medium: Proximity gated on tile coords, not smooth movement — **FIXED 2026-08-09**
 
-**Where:** `Scene_Map.update` (~7948–7959); inner proximity math uses `_realX`/`_realY`
+**Where:** `FugsAudio3Spatial.js` `onUpdate` hook
 
-**What’s wrong:** Even for fixed sources, proximity only recalculates when the player crosses a tile boundary, not while moving within/between tiles. Volume/pan steps instead of updating smoothly.
+**What was wrong:** Even for fixed sources, proximity only recalculated when the player crossed a tile boundary, not while moving within/between tiles. Volume/pan stepped instead of updating smoothly.
+
+**Fix:** Same change as B05 — the `onUpdate` hook now recomputes every frame while proximity is active, and `updateProximityVolume` compares `_realX`/`_realY` (with a per-key dirty check), so fixed-source volume/pan track smooth movement.
 
 **Triggers:** Proximity on a fixed map point; walk slowly. Updates happen in tile jumps.
 
-**Suggested fix:** Compare `_realX`/`_realY`, or run proximity every frame while active. (Overlaps with B05.)
+---
+
+### B15 — Low–Medium: Manual resume doesn’t refresh proximity volume — **FIXED 2026-08-09**
+
+**Where:** `resumeAudio`
+
+**What was wrong:** Resume rebuilt the buffer but never refreshed proximity loudness.
+
+**Fix:** Call `updateProximityVolume()` after successful resume when `proximityData.has(key)` (recreate + in-progress pause cancel paths).
 
 ---
 
-### B15 — Low–Medium: Manual resume doesn’t refresh proximity volume
+### B16 — Low: Pause-with-fadeout blocks resume until timeout — **FIXED 2026-08-09**
 
-**Where:** `resumeAudio` forever/never path (~5558–5654)
+**Where:** `pauseAudio` / `resumeAudio`
 
-**What’s wrong:** Manual resume rebuilds the buffer but never triggers proximity recalc. Wrong level until the player moves (same tile gate as B14/B05).
+**What was wrong:** `pausedTracks` was only set when the fadeout timeout fired, so immediate resume failed.
 
-**Triggers:** Proximity track → pause → resume in place. Volume wrong until movement.
-
-**Suggested fix:** Call `updateProximityVolume()` after successful resume when `proximityData.has(key)`.
-
----
-
-### B16 — Low: Pause-with-fadeout blocks resume until timeout
-
-**Where:** `pauseAudio` fadeout branch (~5422–5460); `resumeAudio` (~5476–5478)
-
-**What’s wrong:** `pausedTracks` is only set when the timeout fires. Resume during fadeout fails (`not paused`); then the timeout still stops and marks paused.
-
-**Triggers:** `pause-bgm1 2` then immediately `resume-bgm1`.
-
-**Suggested fix:** Mark paused (or “pausing”) immediately; cancel pending pause timeout on resume.
+**Fix:** Add to `pausedTracks` immediately; resume cancels pending stop timeout + fades; if buffer still playing, restore mixer without recreating.
 
 ---
 
@@ -255,10 +247,10 @@ These look wrong or fragile but need runtime confirmation or sharper repros befo
 
 ## Fix priority (suggested)
 
-1. **B01** — Broken with default settings; silent BGM after every battle.
-2. **B02** — Documented `(loop:…)` syntax silently ignored from Plugin Commands.
-3. **B03 / B04 / B16** — Pause/resume correctness cluster.
-4. **B05 / B14 / B15** — Proximity update cluster (one fix likely covers all three).
+1. ~~**B01**~~ **fixed** — battle resume.
+2. ~~**B02**~~ **fixed** — plugin-command `loop`.
+3. ~~**B03 / B04 / B16 / B15**~~ **fixed** — pause/resume cluster.
+4. **B05 / B14** — Proximity update cluster (every-frame / realXY dirty flag).
 5. **B06 / B12** — Save/load fidelity.
 6. **B07 / B11** — Sidechain correctness + leak.
 7. **B08–B10, B13** — Fade/cleanup races and bulk-command consistency.

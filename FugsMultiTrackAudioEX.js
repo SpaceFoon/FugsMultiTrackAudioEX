@@ -343,6 +343,7 @@
       }
 
       const fade = {
+        key,
         startValue,
         targetValue,
         duration: duration * 1000,
@@ -391,6 +392,10 @@
       const completedFades = [];
 
       for (const [key, fade] of this.activeFades.entries()) {
+        // B08: skip fades already finalized by a re-entrant update() (RAF vs
+        // watchdog racing, or an onComplete that synchronously drives update()).
+        if (fade._completed) continue;
+
         const elapsed = now - fade.startTime;
         const progress = Math.min(elapsed / fade.duration, 1);
 
@@ -400,12 +405,18 @@
         fade.onUpdate(currentValue);
 
         if (progress >= 1) {
-          fade.onComplete && fade.onComplete();
-          completedFades.push(key);
+          // Mark done and collect; do NOT fire onComplete yet.
+          fade._completed = true;
+          completedFades.push(fade);
         }
       }
 
-      completedFades.forEach((key) => this.activeFades.delete(key));
+      // B08: remove completed fades from the map BEFORE firing onComplete so a
+      // re-entrant update() can never observe (and re-fire) the same fade.
+      completedFades.forEach((fade) => this.activeFades.delete(fade.key));
+      completedFades.forEach((fade) => {
+        if (fade.onComplete) fade.onComplete();
+      });
 
       if (this.activeFades.size > 0) {
         this.rafId = requestAnimationFrame(() => this.update());
@@ -488,6 +499,9 @@
     _sceneTransitionHooks: [],
     _captureStateHooks: [],
     _restoreStateHooks: [],
+    _captureGlobalStateHooks: [],
+    _restoreGlobalStateHooks: [],
+    _savedGlobalMeta: null, // pending __fugsMeta from applySaveData
     _switchGatedHandlers: [],
     _coreLifecycleRegistered: false,
     lastPlayerX: null, // Track player position for proximity dirty-flag optimization
@@ -566,6 +580,8 @@
     onSceneTransition(fn) { if (typeof fn === "function") this._sceneTransitionHooks.push(fn); },
     onCaptureState(fn) { if (typeof fn === "function") this._captureStateHooks.push(fn); },
     onRestoreState(fn) { if (typeof fn === "function") this._restoreStateHooks.push(fn); },
+    onCaptureGlobalState(fn) { if (typeof fn === "function") this._captureGlobalStateHooks.push(fn); },
+    onRestoreGlobalState(fn) { if (typeof fn === "function") this._restoreGlobalStateHooks.push(fn); },
     onSwitchGatedCommand(fn) { if (typeof fn === "function") this._switchGatedHandlers.push(fn); },
 
     _runHooks(list, ...args) {
@@ -577,6 +593,71 @@
     },
 
     runUpdateHooks() { this._runHooks(this._updateHooks); },
+
+    // B06: collect satellite per-track state (e.g. proximity/spatial config) into
+    // one plain object that travels with the saved track state. Each capture hook
+    // receives the track key and returns an object that is merged in (namespaced
+    // by the satellite, e.g. { proximity: {...} }) — undefined/non-objects skipped.
+    _runCaptureHooks(key) {
+      const ext = {};
+      if (!this._captureStateHooks || !this._captureStateHooks.length) return ext;
+      for (let i = 0; i < this._captureStateHooks.length; i++) {
+        try {
+          const part = this._captureStateHooks[i].call(this, key);
+          if (part && typeof part === "object") Object.assign(ext, part);
+        } catch (e) {
+          Logger.error("Capture-state hook failed", { key, error: e && e.message ? e.message : e });
+        }
+      }
+      return ext;
+    },
+
+    // B06: hand the saved satellite state back to each restore hook after the
+    // track has been (re)created, so e.g. proximity can re-bind. Never throws.
+    _runRestoreHooks(key, ext) {
+      if (!this._restoreStateHooks || !this._restoreStateHooks.length) return;
+      const data = ext && typeof ext === "object" ? ext : {};
+      for (let i = 0; i < this._restoreStateHooks.length; i++) {
+        try {
+          this._restoreStateHooks[i].call(this, key, data);
+        } catch (e) {
+          Logger.error("Restore-state hook failed", { key, error: e && e.message ? e.message : e });
+        }
+      }
+    },
+
+    // Global (non-per-track) satellite state for save files — e.g. active pump.
+    // Stored under reserved key __fugsMeta in getSaveData(); never treated as a
+    // named snapshot.
+    _runGlobalCaptureHooks() {
+      const meta = {};
+      if (!this._captureGlobalStateHooks || !this._captureGlobalStateHooks.length) return meta;
+      for (let i = 0; i < this._captureGlobalStateHooks.length; i++) {
+        try {
+          const part = this._captureGlobalStateHooks[i].call(this);
+          if (part && typeof part === "object") Object.assign(meta, part);
+        } catch (e) {
+          Logger.error("Capture-global-state hook failed", {
+            error: e && e.message ? e.message : e,
+          });
+        }
+      }
+      return meta;
+    },
+
+    _runGlobalRestoreHooks(meta) {
+      if (!this._restoreGlobalStateHooks || !this._restoreGlobalStateHooks.length) return;
+      const data = meta && typeof meta === "object" ? meta : {};
+      for (let i = 0; i < this._restoreGlobalStateHooks.length; i++) {
+        try {
+          this._restoreGlobalStateHooks[i].call(this, data);
+        } catch (e) {
+          Logger.error("Restore-global-state hook failed", {
+            error: e && e.message ? e.message : e,
+          });
+        }
+      }
+    },
 
     tryPlayAlias(aliasName, type, trackId) {
       if (typeof this.playAlias === "function") return this.playAlias(aliasName, type, trackId);
@@ -1105,6 +1186,82 @@
       }
     },
 
+    /**
+     * Schedule auto-cleanup / repeat restart after a non-forever track ends.
+     * Shared by playAudio and resumeAudio (fixes B04 one-shot resume cleanup).
+     */
+    _scheduleTrackEndAction(key, buffer, offsetSeconds = 0) {
+      if (!buffer || !key) return;
+
+      const trackTimeout = (timeoutId) => {
+        if (!this.activeTimeouts.has(key)) {
+          this.activeTimeouts.set(key, []);
+        }
+        this.activeTimeouts.get(key).push(timeoutId);
+      };
+
+      const removeTrackedTimeout = (timeoutId) => {
+        if (!this.activeTimeouts.has(key)) return;
+        const list = this.activeTimeouts.get(key);
+        const index = list.indexOf(timeoutId);
+        if (index > -1) list.splice(index, 1);
+        if (list.length === 0) this.activeTimeouts.delete(key);
+      };
+
+      const schedule = () => {
+        if (this.tracks.get(key) !== buffer) return;
+        if (buffer._fugsManualStop) return;
+
+        const totalTime = typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
+        const pitchNow =
+          typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
+
+        if (totalTime <= 0) {
+          const retryId = setTimeout(schedule, 200);
+          trackTimeout(retryId);
+          return;
+        }
+
+        const remaining = Math.max(0, totalTime - (offsetSeconds || 0));
+        const delayMs = Math.max(50, (remaining / pitchNow) * 1000 + 60);
+        const timeoutId = setTimeout(() => {
+          removeTrackedTimeout(timeoutId);
+          if (this.tracks.get(key) !== buffer) return;
+          if (buffer._fugsManualStop) return;
+
+          if (
+            typeof buffer._fugsLoopRepeatsRemaining === "number" &&
+            buffer._fugsLoopRepeatsRemaining > 0
+          ) {
+            buffer._fugsLoopRepeatsRemaining -= 1;
+            buffer.play(false, 0);
+            if (buffer._effect) {
+              this.connectEffectChain(key, buffer);
+            }
+            this._scheduleTrackEndAction(key, buffer, 0);
+            return;
+          }
+
+          Logger.info(`Auto-cleanup: ${key} finished playing`);
+          this._releaseBuffer(buffer);
+          this.tracks.delete(key);
+          this.cleanupTrack(key);
+        }, delayMs);
+        trackTimeout(timeoutId);
+      };
+
+      if (
+        typeof buffer.isReady === "function" &&
+        !buffer.isReady() &&
+        typeof buffer.addLoadListener === "function"
+      ) {
+        buffer.addLoadListener(schedule);
+        return;
+      }
+
+      schedule();
+    },
+
     playAudio(options) {
       const {
         type,
@@ -1206,87 +1363,15 @@
           buffer.play(shouldLoop);
         }
 
-        const trackTimeout = (timeoutId) => {
-          if (!this.activeTimeouts.has(key)) {
-            this.activeTimeouts.set(key, []);
-          }
-          this.activeTimeouts.get(key).push(timeoutId);
-        };
-
-        const removeTrackedTimeout = (timeoutId) => {
-          if (!this.activeTimeouts.has(key)) return;
-          const list = this.activeTimeouts.get(key);
-          const index = list.indexOf(timeoutId);
-          if (index > -1) list.splice(index, 1);
-          if (list.length === 0) this.activeTimeouts.delete(key);
-        };
-
-        const scheduleEndAction = (offsetSeconds) => {
-          // Runs after the engine's internal end timer stops the audio.
-          // For repeat loops, we restart; otherwise we cleanup the track.
-          const schedule = () => {
-            if (this.tracks.get(key) !== buffer) return;
-            if (buffer._fugsManualStop) return;
-
-            const totalTime = typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
-            const pitchNow =
-              typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
-
-            if (totalTime <= 0) {
-              const retryId = setTimeout(schedule, 200);
-              trackTimeout(retryId);
-              return;
-            }
-
-            const remaining = Math.max(0, totalTime - (offsetSeconds || 0));
-            const delayMs = Math.max(50, (remaining / pitchNow) * 1000 + 60);
-            const timeoutId = setTimeout(() => {
-              removeTrackedTimeout(timeoutId);
-              if (this.tracks.get(key) !== buffer) return;
-              if (buffer._fugsManualStop) return;
-
-              if (
-                typeof buffer._fugsLoopRepeatsRemaining === "number" &&
-                buffer._fugsLoopRepeatsRemaining > 0
-              ) {
-                buffer._fugsLoopRepeatsRemaining -= 1;
-                buffer.play(false, 0);
-                if (effect) {
-                  this.connectEffectChain(key, buffer);
-                }
-                scheduleEndAction(0);
-                return;
-              }
-
-              Logger.info(`Auto-cleanup: ${key} finished playing`);
-              this._releaseBuffer(buffer);
-              this.tracks.delete(key);
-              this.cleanupTrack(key);
-            }, delayMs);
-            trackTimeout(timeoutId);
-          };
-
-          if (
-            typeof buffer.isReady === "function" &&
-            !buffer.isReady() &&
-            typeof buffer.addLoadListener === "function"
-          ) {
-            buffer.addLoadListener(schedule);
-            return;
-          }
-
-          schedule();
-        };
-
         // Loop modes:
         // - forever: use WebAudio looping (no end timer)
         // - repeat: play once, then restart on end N times
         // - never: play once
         if (loopCfg.mode === "repeat") {
           buffer._fugsLoopRepeatsRemaining = loopCfg.repeatCount;
-          scheduleEndAction(startTime);
+          this._scheduleTrackEndAction(key, buffer, startTime);
         } else if (!shouldLoop) {
-          scheduleEndAction(startTime);
+          this._scheduleTrackEndAction(key, buffer, startTime);
         }
 
         // Connect effect chain AFTER buffer.play() creates _sourceNode
@@ -1795,6 +1880,10 @@
 
       for (const [key] of entries) {
         if (key.startsWith(type)) {
+          // B13: skip paused tracks so their stopped buffer isn't modified — the
+          // change would be lost on resume (mirrors fadeAllAudio's global skip).
+          if (this.pausedTracks && this.pausedTracks.has(key)) continue;
+
           const trackId = key.split("_")[1];
           if (
             this.fadeAudio(type, trackId, { volume, duration, pan, pitch }, () => {
@@ -1859,6 +1948,12 @@
         return false;
       }
 
+      // B03: already paused (or pause-with-fade in progress) — keep snapshot/seek
+      if (this.pausedTracks.has(key)) {
+        Logger.info(`Track ${key} already paused — keeping saved position`);
+        return true;
+      }
+
       // Use RPG Maker's built-in position tracking
       let currentTime = 0;
       if (buffer.seek && typeof buffer.seek === "function") {
@@ -1906,13 +2001,16 @@
         this.stopPanSweep(type, trackId);
       }
 
-      // Cancel pending timeouts for this track
+      // Cancel pending timeouts for this track (end timers, prior pause fades)
       if (this.activeTimeouts.has(key)) {
         const timeoutIds = this.activeTimeouts.get(key);
         timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
         this.activeTimeouts.delete(key);
         Logger.info(`Cancelled ${timeoutIds.length} pending timeout(s) for paused ${key}`);
       }
+
+      // B16: mark paused immediately so resume works during fadeout
+      this.pausedTracks.add(key);
 
       const fadeout = this.toNum(args[0], 0);
       const pan = args[1] !== undefined ? this.toNum(args[1]) : undefined;
@@ -1927,20 +2025,19 @@
           pitch: pitch,
         });
 
-        // Schedule buffer pause via setTimeout to ensure it happens even if fade is cancelled
+        // Schedule buffer stop (track already in pausedTracks)
         const pauseDelay = Math.max(fadeout || 0, 0);
         const timeoutId = setTimeout(() => {
-          // Only pause if buffer hasn't been replaced
-          if (this.tracks.get(key) === buffer) {
+          // Only stop if still paused and buffer hasn't been replaced/resumed
+          if (this.tracks.get(key) === buffer && this.pausedTracks.has(key)) {
             try {
               buffer.stop();
             } catch (_e) {
               // DOMException if already stopped or context closed
             }
-            this.pausedTracks.add(key);
             Logger.success(`Pause complete for ${key}`);
           } else {
-            Logger.info(`Pause skipped - ${key} was replaced`);
+            Logger.info(`Pause stop skipped - ${key} was resumed or replaced`);
           }
 
           // Remove timeout from tracking
@@ -1952,7 +2049,7 @@
           }
         }, pauseDelay * 1000);
 
-        // Track this timeout for cleanup
+        // Track this timeout for cleanup / resume cancel
         if (!this.activeTimeouts.has(key)) {
           this.activeTimeouts.set(key, []);
         }
@@ -1963,7 +2060,6 @@
         } catch (_e) {
           // DOMException if already stopped or context closed
         }
-        this.pausedTracks.add(key);
       }
 
       return true;
@@ -1976,6 +2072,17 @@
         Logger.warn(`Track ${key} is not paused`);
         return false;
       }
+
+      // B16: cancel pending pause-stop timeout and in-progress pause fades
+      if (this.activeTimeouts.has(key)) {
+        const timeoutIds = this.activeTimeouts.get(key);
+        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
+        this.activeTimeouts.delete(key);
+        Logger.info(`Cancelled ${timeoutIds.length} pending timeout(s) for resume ${key}`);
+      }
+      FadeManager.cancelFade(`${key}_volume`);
+      FadeManager.cancelFade(`${key}_pan`);
+      FadeManager.cancelFade(`${key}_pitch`);
 
       // Get snapshot (preferred) or fall back to buffer
       const snapshot = this.pausedSnapshots.get(key);
@@ -2011,7 +2118,7 @@
       const loopMode = snapshot ? snapshot.loopMode : buffer ? buffer._fugsLoopMode : null;
 
       // For repeat-mode tracks, delegate to playAudio which owns the
-      // scheduleEndAction timer.  The manual resume path below handles
+      // end-action timer.  The manual resume path below handles
       // forever/never modes only (WebAudio native loop or one-shot).
       if (loopMode === "repeat") {
         const remaining = snapshot
@@ -2054,12 +2161,57 @@
         });
       }
 
+      // B16 fast path: pause fade still running — buffer never stopped
+      if (buffer && typeof buffer.isPlaying === "function" && buffer.isPlaying()) {
+        buffer._manualVolume = Math.max(0, Math.min(1, resumeVolume / 100));
+        buffer.pan = Math.max(-1, Math.min(1, resumePan / 100));
+        buffer._basePitch = Math.max(0.1, Math.min(4, resumePitch / 100));
+        this.updateTrackPitch(buffer);
+        if (fadein > 0) {
+          buffer.volume = 0;
+          this.fadeAudio(type, trackId, { volume: resumeVolume, duration: fadein });
+        } else {
+          buffer.volume = Math.max(0, Math.min(1, resumeVolume / 100));
+        }
+        // Pause cancelled end timers — re-arm for one-shots (B04)
+        const typeKeyFast = (type || "").toLowerCase();
+        const shouldLoopFast =
+          loopMode === "forever" ||
+          (loopMode == null && typeKeyFast !== "se" && typeKeyFast !== "me");
+        if (!shouldLoopFast) {
+          let posFast = startPos;
+          if (buffer.seek && typeof buffer.seek === "function") {
+            try {
+              posFast = buffer.seek();
+            } catch (_e) {
+              /* keep startPos */
+            }
+          }
+          this._scheduleTrackEndAction(key, buffer, posFast);
+        }
+        this.pausedTracks.delete(key);
+        this.pausedSnapshots.delete(key);
+        if (this.proximityData.has(key) && typeof this.updateProximityVolume === "function") {
+          try {
+            this.updateProximityVolume();
+          } catch (proxErr) {
+            Logger.warn(`Proximity refresh after resume failed for ${key}`, {
+              error: proxErr && proxErr.message ? proxErr.message : proxErr,
+            });
+          }
+        }
+        Logger.success(`Resumed ${key} (cancelled in-progress pause fade)`);
+        return true;
+      }
+
       Logger.info(`Resuming ${key} from position: ${startPos}s using RPG Maker method`);
 
       try {
         // Dispose any existing effect chain tied to the paused buffer BEFORE we replace the buffer.
         // This avoids leaking WebAudio nodes when resume swaps the buffer object.
-        this.clearEffect(key, { keepConfig: true });
+        if (this.effectChains && this.effectChains.has(key)) {
+          this.clearEffect(key, { keepConfig: true });
+        }
 
         // Create new buffer (we have to because the old one was stopped)
         let newBuffer;
@@ -2132,6 +2284,11 @@
           newBuffer.play(shouldLoop);
         }
 
+        // B04: re-arm end cleanup for one-shots (pause cancelled the old timer)
+        if (!shouldLoop) {
+          this._scheduleTrackEndAction(key, newBuffer, startPos);
+        }
+
         // Apply fade-in if needed
         if (fadein > 0) {
           this.fadeAudio(type, trackId, {
@@ -2150,6 +2307,18 @@
 
         this.pausedTracks.delete(key);
         this.pausedSnapshots.delete(key); // Clean up snapshot
+
+        // B15: refresh proximity loudness after buffer swap (never fail resume)
+        if (this.proximityData.has(key) && typeof this.updateProximityVolume === "function") {
+          try {
+            this.updateProximityVolume();
+          } catch (proxErr) {
+            Logger.warn(`Proximity refresh after resume failed for ${key}`, {
+              error: proxErr && proxErr.message ? proxErr.message : proxErr,
+            });
+          }
+        }
+
         Logger.success(`Successfully resumed ${key} from ${startPos}s!`);
         return true;
       } catch (error) {
@@ -2343,6 +2512,20 @@
      * immediately instead of waiting for the entire object to be collected.
      * Safe to call multiple times or on already-released buffers.
      */
+    // B09: stop a buffer's playback without throwing if it's already stopped or
+    // lacks a stop() method (some stub/compat buffers). Used before releasing
+    // orphaned tracks so audio actually stops instead of just losing its map ref.
+    _stopBufferSafely(buffer) {
+      if (!buffer) return;
+      try {
+        if (typeof buffer.stop === "function") {
+          buffer.stop();
+        }
+      } catch (_e) {
+        /* already stopped / not startable — safe to ignore */
+      }
+    },
+
     _releaseBuffer(buffer) {
       if (!buffer) return;
       // Null the decoded PCM data (the big memory consumer)
@@ -2473,6 +2656,8 @@
             ? pausedSnapshot.loopRepeatsRemaining
             : buffer._fugsLoopRepeatsRemaining || 0
           : buffer._fugsLoopRepeatsRemaining || 0,
+        // B06: satellite state (proximity, etc.) so save/load doesn't drop it.
+        ext: this._runCaptureHooks(key),
       };
     },
 
@@ -2516,15 +2701,51 @@
       };
 
       if (this.playAudio(options)) {
-        // If the track was paused when saved, pause it immediately after restoring
+        // If the track was paused when saved, re-pause after restoring.
         if (state.isPaused) {
-          this.pauseAudio(type, trackId, [0]); // Pause with no fadeout
+          this._restorePausedTrack(key, type, trackId, state);
         }
+        // B06: let satellites (proximity/spatial) re-bind their saved state now
+        // that the track exists again.
+        this._runRestoreHooks(key, state.ext);
         Logger.info(`Restored state for ${key}${state.isPaused ? " (paused)" : ""}`);
         return true;
       }
 
       return false;
+    },
+
+    // B12: load-aware paused restore. playAudio() starts the track (possibly on a
+    // cold/undecoded buffer where seek() returns 0), so pausing immediately can
+    // both lose the saved position and briefly play audio. Wait for the buffer to
+    // be ready before stopping, then overwrite the paused snapshot's position with
+    // the authoritative saved value.
+    _restorePausedTrack(key, type, trackId, state) {
+      const buffer = this.tracks.get(key);
+      const savedPos = this.toNum(state.currentTime, 0);
+
+      const finalizePause = () => {
+        // Guard: track may have been replaced/stopped during the load wait.
+        if (this.tracks.get(key) !== buffer) return;
+        this.pauseAudio(type, trackId, [0]); // no fadeout — stop immediately
+
+        // Force the authoritative saved position (seek() on a cold buffer is 0).
+        const snap = this.pausedSnapshots.get(key);
+        if (snap) snap.pos = savedPos;
+        if (buffer) buffer._pausedPos = savedPos;
+      };
+
+      const supportsReady = buffer && typeof buffer.isReady === "function";
+      const isReady = supportsReady ? buffer.isReady() : true;
+      const canWait = buffer && typeof buffer.addLoadListener === "function";
+
+      if (supportsReady && !isReady && canWait) {
+        // Defer the stop until the buffer is decoded so the position is correct
+        // and no audio plays before we stop it.
+        buffer.addLoadListener(finalizePause);
+      } else {
+        finalizePause();
+      }
     },
 
     loadAllStates(stateName = "auto") {
@@ -2537,6 +2758,20 @@
       let count = 0;
       for (const [key, state] of snapshot.entries()) {
         if (this.loadTrackState(key, state)) count++;
+      }
+
+      // B06: second restore pass after all tracks exist so peer-dependent
+      // satellite state (sidechain links) can bind. Hooks are idempotent —
+      // proximity re-sets, panSweep restarts via stop+start, sidechain skips
+      // if the connection is already active.
+      for (const [key, state] of snapshot.entries()) {
+        if (this.tracks.has(key)) this._runRestoreHooks(key, state && state.ext);
+      }
+
+      // Global satellite state (pump, etc.) restored once tracks are up.
+      if (this._savedGlobalMeta) {
+        this._runGlobalRestoreHooks(this._savedGlobalMeta);
+        this._savedGlobalMeta = null;
       }
 
       Logger.success(`Restored ${count} tracks from snapshot '${stateName}'`);
@@ -2554,6 +2789,11 @@
         }
         data[name] = snapshotObj;
       }
+      // Reserved key — never a named snapshot. Holds global satellite state.
+      const meta = this._runGlobalCaptureHooks();
+      if (meta && Object.keys(meta).length > 0) {
+        data.__fugsMeta = meta;
+      }
       return data;
     },
 
@@ -2562,7 +2802,13 @@
 
       // Restore snapshots from plain object
       this.namedSnapshots.clear();
+      this._savedGlobalMeta = null;
       for (const [name, snapshotObj] of Object.entries(data)) {
+        // Reserved global-meta key (pump / future hub-level state)
+        if (name === "__fugsMeta") {
+          this._savedGlobalMeta = snapshotObj;
+          continue;
+        }
         const snapshot = new Map();
         for (const [key, state] of Object.entries(snapshotObj)) {
           snapshot.set(key, state);
@@ -2896,13 +3142,22 @@
           if (buffer && isPlayingCheck) {
             validTracks.set(key, buffer);
           } else {
-            // Track is dead, clean it up
+            // Track is dead, clean it up.
+            // B09: stop + release the buffer before dropping the reference.
+            // cleanupTrack() only tears down maps/fades/effects, so without this
+            // a still-playing (or spuriously not-playing) buffer would keep its
+            // decoded PCM/WebAudio nodes alive until GC — a leak on every scene
+            // transition. Order: stop, cleanupTrack (fades/hooks), release nodes.
+            this._stopBufferSafely(buffer);
             this.cleanupTrack(key);
+            this._releaseBuffer(buffer);
             Logger.info(`Cleaned up orphaned track: ${key}`);
           }
         } catch (_error) {
           // Track is corrupted, remove it
+          this._stopBufferSafely(buffer);
           this.cleanupTrack(key);
+          this._releaseBuffer(buffer);
           Logger.warn(`Removed corrupted track: ${key}`);
         }
       }
@@ -3683,6 +3938,19 @@
     Scene_Battle.prototype.terminate = function () {
       _Scene_Battle_terminate.call(this);
       if (SceneManager.isNextScene(Scene_Map)) {
+        // Mirror menu terminate: resume tracks that auto-paused for battle
+        // (handleSceneTransition does not resume pausedTracks).
+        const battlePausedTracks = Array.from(FugsMultiTrackAudioEX.pausedTracks).filter(
+          (key) => {
+            const buffer = FugsMultiTrackAudioEX.tracks.get(key);
+            return buffer && buffer._pauseMode === "battle";
+          }
+        );
+        battlePausedTracks.forEach((key) => {
+          const [type, trackId] = key.split("_");
+          FugsMultiTrackAudioEX.resumeAudio(type, trackId, []);
+          Logger.info(`Resumed ${key} after battle exit`);
+        });
         FugsMultiTrackAudioEX.handleSceneTransition("scene", SceneFadeoutTime);
       }
     };

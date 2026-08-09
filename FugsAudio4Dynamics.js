@@ -187,6 +187,7 @@
 
         // Envelope follower state
         let currentGain = 1.0;
+        let lastFrameTime = null; // B11: for real frame-delta envelope timing
         const connectionKey = `${sourceId}_to_${targetId}`;
 
         // Compute envelope and apply gain reduction
@@ -213,10 +214,18 @@
               targetGain = Math.max(0.0, 1.0 - reduction);
             }
 
-            // Apply attack/release envelope smoothing
+            // Apply attack/release envelope smoothing.
+            // B11: this callback runs once per animation frame (~60 Hz), not per
+            // audio sample. Use the real elapsed time between frames (dt) so the
+            // attack/release args behave as documented seconds instead of being
+            // divided by sampleRate (which made them ~1000x too slow).
             const now = context.currentTime;
-            const attackCoeff = Math.exp(-1 / (attack * context.sampleRate));
-            const releaseCoeff = Math.exp(-1 / (release * context.sampleRate));
+            const dt = lastFrameTime != null
+              ? Math.max(0.001, Math.min(0.1, now - lastFrameTime))
+              : 1 / 60;
+            lastFrameTime = now;
+            const attackCoeff = Math.exp(-dt / attack);
+            const releaseCoeff = Math.exp(-dt / release);
 
             if (targetGain < currentGain) {
               // Attack (gain reduction)
@@ -255,6 +264,15 @@
             }
           }
         };
+
+        // B07: dispose any existing connection for this source/target before
+        // overwriting the map entry, otherwise the old analyser + RAF loop keep
+        // running (leaked node, two envelope followers fighting over target gain).
+        const existingConnection = this.sidechainConnections.get(connectionKey);
+        if (existingConnection) {
+          this._disposeSidechainConnection(connectionKey, existingConnection, { restoreTarget: false });
+          Logger.info(`Sidechain ${connectionKey} replaced: disposed previous connection`);
+        }
 
         // Store connection state
         const connection = {
@@ -490,6 +508,10 @@
 
       for (const [key] of this.tracks.entries()) {
         if (key.startsWith(type)) {
+          // B13: skip paused tracks (their buffer is stopped; the duck would be
+          // lost on resume). Mirrors duckAllAudio's global skip.
+          if (this.pausedTracks && this.pausedTracks.has(key)) continue;
+
           const trackId = key.split("_")[1];
           if (this.duckVolume(type, trackId, duckLevel, fadeTime, holdTime, switchId)) {
             count++;
@@ -567,6 +589,9 @@
       let count = 0;
 
       for (const [key] of this.tracks.entries()) {
+        // B13: skip paused tracks (stopped buffer; change lost on resume).
+        if (this.pausedTracks && this.pausedTracks.has(key)) continue;
+
         const [type, trackId] = key.split("_");
         if (this.fadeAudio(type, trackId, { pitch: targetPitch, duration })) {
           count++;
@@ -584,6 +609,9 @@
 
       for (const [key] of this.tracks.entries()) {
         if (key.startsWith(type)) {
+          // B13: skip paused tracks (stopped buffer; change lost on resume).
+          if (this.pausedTracks && this.pausedTracks.has(key)) continue;
+
           const trackId = key.split("_")[1];
           if (this.fadeAudio(type, trackId, { pitch: targetPitch, duration })) {
             count++;
@@ -741,6 +769,107 @@
       } catch (_e) {}
       buffer._pumpGainNode = null;
     }
+  });
+
+  // B06 leftover: persist active sidechain links. Stored on BOTH source and
+  // target track state so whichever loads second can bind once peers exist.
+  // loadAllStates also runs a second restore pass after all tracks are up.
+  hub.onCaptureState(function (key) {
+    if (!key.startsWith("bgm_") || !this.sidechainConnections || this.sidechainConnections.size === 0) {
+      return undefined;
+    }
+    const trackId = key.substring(4);
+    const links = [];
+    for (const [connKey, conn] of this.sidechainConnections.entries()) {
+      if (!conn || !conn.active) continue;
+      const parts = connKey.split("_to_");
+      if (parts.length !== 2) continue;
+      if (parts[0] !== trackId && parts[1] !== trackId) continue;
+      links.push({
+        sourceId: parts[0],
+        targetId: parts[1],
+        threshold: conn.threshold,
+        ratio: conn.ratio,
+        attack: conn.attack,
+        release: conn.release,
+      });
+    }
+    return links.length ? { sidechains: links } : undefined;
+  });
+
+  hub.onRestoreState(function (key, ext) {
+    if (!ext || !Array.isArray(ext.sidechains) || !ext.sidechains.length) return;
+    if (typeof this.setupSidechain !== "function") return;
+
+    for (let i = 0; i < ext.sidechains.length; i++) {
+      const link = ext.sidechains[i];
+      if (!link || link.sourceId == null || link.targetId == null) continue;
+      const sourceKey = "bgm_" + link.sourceId;
+      const targetKey = "bgm_" + link.targetId;
+      // Wait until both peers exist (second loadAllStates pass handles the rest).
+      if (!this.tracks.has(sourceKey) || !this.tracks.has(targetKey)) continue;
+
+      const connKey = link.sourceId + "_to_" + link.targetId;
+      // Skip if an identical active connection is already bound.
+      if (this.sidechainConnections && this.sidechainConnections.has(connKey)) continue;
+
+      try {
+        this.setupSidechain([
+          String(link.sourceId),
+          String(link.targetId),
+          link.threshold != null ? link.threshold : 0.5,
+          link.ratio != null ? link.ratio : 4,
+          link.attack != null ? link.attack : 0.01,
+          link.release != null ? link.release : 0.1,
+        ]);
+        Logger.info("Restored sidechain " + connKey + " (via " + key + ")");
+      } catch (e) {
+        Logger.warn("Sidechain restore failed for " + connKey, {
+          error: e && e.message ? e.message : e,
+        });
+      }
+    }
+  });
+
+  // Persist active rhythmic pump across RPG Maker save/load (global meta).
+  hub.onCaptureGlobalState(function () {
+    if (!this.pumpConfig || !this.pumpConfig.active) return undefined;
+    return {
+      pump: {
+        active: true,
+        bpm: this.pumpConfig.bpm,
+        depth: this.pumpConfig.depth,
+        shape: this.pumpConfig.shape,
+        tracks: this.pumpConfig.tracks,
+      },
+    };
+  });
+
+  hub.onRestoreGlobalState(function (meta) {
+    if (!meta || !meta.pump || !meta.pump.active) {
+      if (this.pumpConfig) this.pumpConfig.active = false;
+      return;
+    }
+    const p = meta.pump;
+    this.pumpConfig = {
+      active: true,
+      bpm: p.bpm != null ? p.bpm : 120,
+      depth: p.depth != null ? p.depth : 0.5,
+      shape: p.shape || "sine",
+      tracks: p.tracks || "all",
+      // Reset phase so restore doesn't jump mid-cycle from a stale startTime.
+      startTime: typeof performance !== "undefined" && performance.now ? performance.now() : Date.now(),
+    };
+    Logger.info(
+      "Restored rhythmic pump: " +
+        this.pumpConfig.bpm +
+        "bpm, " +
+        this.pumpConfig.shape +
+        ", depth " +
+        this.pumpConfig.depth +
+        " on " +
+        this.pumpConfig.tracks
+    );
   });
 
   Logger.success(TAG + " loaded — duck / pump / sidechain / pitchbendall ready");

@@ -1000,10 +1000,12 @@
  * File:   js/plugins/FugsMultiTrackAudioEX.js
  * Runtime assumptions: NW.js 0.29+ (Chromium 65 / Node 9.7.1).
  *
- * Full playbook + complete reference:
- *   DEV/sources/plugins/FugsMultiTrackAudioEX.CLAUDE.md
- * Quick preset/effect test sheet:
- *   AUDIO_TESTS.md
+ * Repo docs:
+ *   README.md                         — install + load order
+ *   docs/MULTI_PLUGIN_SPLIT_PLAN.md   — architecture / phases
+ *   docs/BUGS.md                      — known defects (B01–B16 fixed)
+ *   scripts/verify-all.js             — offline Node verification gate
+ *   dist/FugsMultiTrackAudioEX.bundle.js — optional all-in-one build
  *
  * =========================================================================
  * PLUGIN PACK (load order)
@@ -1017,6 +1019,9 @@
  *   FugsAudio6Aliases       ← optional
  *   FugsAudio7Compat        ← optional (after OcRam if used)
  *   FugsAudio8Test          ← dev only
+ *
+ * Alternate: use dist/FugsMultiTrackAudioEX.bundle.js alone instead of Core+2…7
+ * (do not also enable the individual satellites). Rebuild: node scripts/build-bundle.js
  *
  * This plugin has no runtime behavior. It exists so Plugin Manager can show
  * the full playbook. Keep it ON in production builds if you want in-editor help.

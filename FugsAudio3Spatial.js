@@ -315,8 +315,10 @@
     };
 
   hub.updateProximityVolume = function() {
-      // Safety checks
-      if (!$gamePlayer || !$dataMap || !$gameMap) return;
+      // Safety checks — use typeof so missing globals don't throw ReferenceError
+      if (typeof $gamePlayer === "undefined" || !$gamePlayer) return;
+      if (typeof $dataMap === "undefined" || !$dataMap) return;
+      if (typeof $gameMap === "undefined" || !$gameMap) return;
 
       const playerX = $gamePlayer.x;
       const playerY = $gamePlayer.y;
@@ -677,14 +679,12 @@
   });
 
   hub.onUpdate(function () {
+    // B05/B14: run every frame while proximity is active so event-bound sources
+    // update even when the player stands still, and fixed sources track smooth
+    // (sub-tile) movement. updateProximityVolume() has a per-key dirty check on
+    // _realX/_realY (and always runs when doppler is on), so idle frames are cheap.
     if (this.proximityData && this.proximityData.size > 0 && typeof $gamePlayer !== "undefined" && $gamePlayer) {
-      const currentX = $gamePlayer.x;
-      const currentY = $gamePlayer.y;
-      if (this.lastPlayerX !== currentX || this.lastPlayerY !== currentY) {
-        this.updateProximityVolume();
-        this.lastPlayerX = currentX;
-        this.lastPlayerY = currentY;
-      }
+      this.updateProximityVolume();
     }
   });
 
@@ -701,6 +701,94 @@
         if (!errorKey.startsWith(prefix)) filtered.add(errorKey);
       }
       this.proximityErrors = filtered;
+    }
+  });
+
+  // B06: persist proximity + pan-sweep config across save/load.
+  // proximityConfig / panSweep are flat JSON-serializable objects.
+  hub.onCaptureState(function (key) {
+    const out = {};
+    if (this.proximityData && this.proximityData.has(key)) {
+      const cfg = this.proximityData.get(key);
+      out.proximity = {
+        x: cfg.x,
+        y: cfg.y,
+        eventId: cfg.eventId,
+        followPlayer: cfg.followPlayer,
+        maxDistance: cfg.maxDistance,
+        minVolume: cfg.minVolume,
+        curve: cfg.curve,
+        customPoints: cfg.customPoints,
+        enablePan: cfg.enablePan,
+        doppler: cfg.doppler,
+        dopplerScale: cfg.dopplerScale,
+        dopplerSmoothing: cfg.dopplerSmoothing,
+      };
+    }
+    if (this.panSweeps && this.panSweeps.has(key)) {
+      const s = this.panSweeps.get(key);
+      // Convert internal -1..1 / halfDuration back to startPanSweep args.
+      out.panSweep = {
+        minPan: Math.round((s.min != null ? s.min : -1) * 100),
+        maxPan: Math.round((s.max != null ? s.max : 1) * 100),
+        duration: (s.halfDuration != null ? s.halfDuration : 2) * 2,
+        // 0 = forever (matches startPanSweep: loops<=0 → Infinity halves)
+        loops:
+          s.remainingHalves === Infinity
+            ? 0
+            : Math.max(1, Math.ceil((s.remainingHalves || 0) / 2)),
+        curve: s.curve || "smooth",
+      };
+    }
+    return Object.keys(out).length ? out : undefined;
+  });
+
+  hub.onRestoreState(function (key, ext) {
+    if (!ext) return;
+
+    if (ext.proximity) {
+      const restored = Object.assign({}, ext.proximity, {
+        // Reset transient runtime fields so the first update recomputes cleanly.
+        lastDistance: null,
+        lastSourceX: undefined,
+        lastSourceY: undefined,
+        lastTargetX: undefined,
+        lastTargetY: undefined,
+      });
+      this.proximityData.set(key, restored);
+      if (typeof this.updateProximityVolume === "function") {
+        try {
+          this.updateProximityVolume();
+        } catch (e) {
+          Logger.warn("Proximity restore refresh failed for " + key, {
+            error: e && e.message ? e.message : e,
+          });
+        }
+      }
+      Logger.info("Restored proximity for " + key, restored);
+    }
+
+    if (ext.panSweep && typeof this.startPanSweep === "function" && this.tracks.has(key)) {
+      const ps = ext.panSweep;
+      const parts = key.split("_");
+      const type = parts[0];
+      const trackId = parts.slice(1).join("_") || "1";
+      try {
+        this.startPanSweep(
+          type,
+          trackId,
+          ps.minPan != null ? ps.minPan : -100,
+          ps.maxPan != null ? ps.maxPan : 100,
+          ps.duration != null ? ps.duration : 4,
+          ps.loops != null ? ps.loops : 0,
+          ps.curve || "smooth"
+        );
+        Logger.info("Restored pan sweep for " + key, ps);
+      } catch (e) {
+        Logger.warn("Pan sweep restore failed for " + key, {
+          error: e && e.message ? e.message : e,
+        });
+      }
     }
   });
 

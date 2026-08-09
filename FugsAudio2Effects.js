@@ -1606,6 +1606,11 @@
         return false;
       }
 
+      // B10: any direct effect application supersedes a pending crossfade for
+      // this key, so bump the generation token to abort its mid-point timeout.
+      if (!this._effectCrossfadeGen) this._effectCrossfadeGen = new Map();
+      this._effectCrossfadeGen.set(key, (this._effectCrossfadeGen.get(key) || 0) + 1);
+
       // Clean up existing effect chain if present
       if (this.effectChains.has(key)) {
         this.clearEffect(key);
@@ -1852,33 +1857,41 @@
         `Starting effect cross-fade for ${key}: ${oldEffect} -> ${newEffect} over ${duration}s with curve ${curve}`
       );
 
+      // B10: generation token per key. Each crossfade (or effect swap) bumps the
+      // token so a superseded crossfade's mid-point timeout aborts instead of
+      // clobbering the newer effect chain. fadeOutEffect's own guard already
+      // covers the intra-crossfade ordering; this covers *interleaved* commands.
+      if (!this._effectCrossfadeGen) this._effectCrossfadeGen = new Map();
+      const gen = (this._effectCrossfadeGen.get(key) || 0) + 1;
+      this._effectCrossfadeGen.set(key, gen);
+
       // Start fade out of old effect
       this.fadeOutEffect(key, duration / 2);
 
       // After half duration, start new effect
       const timeoutId = setTimeout(
         () => {
+          // B10: bail if a newer crossfade/effect superseded this one.
+          if (this._effectCrossfadeGen.get(key) !== gen) {
+            Logger.info(`Effect cross-fade for ${key} superseded — skipping new effect apply`);
+            if (this.activeTimeouts.has(key)) {
+              const timeouts = this.activeTimeouts.get(key);
+              const idx = timeouts.indexOf(timeoutId);
+              if (idx > -1) timeouts.splice(idx, 1);
+              if (timeouts.length === 0) this.activeTimeouts.delete(key);
+            }
+            return;
+          }
+
           // Check if track still exists before applying new effect
           if (!this.tracks.has(key)) {
             Logger.warn(`Effect cross-fade cancelled - track ${key} no longer exists`);
             return;
           }
 
-          // Ensure we are still targeting the same effect transition
-          // (In case another effect command was issued during the fade-out)
-          const currentChain = this.effectChains.get(key);
-          if (currentChain) {
-            // If a chain exists, it means fadeOutEffect didn't finish or was interrupted
-            // But fadeOutEffect uses its own timeout now, so it should be gone unless a NEW effect was applied.
-            // If a NEW effect is there, we shouldn't overwrite it.
-            // However, fadeOutEffect deletes the chain at the END of the fade.
-            // We are running at duration/2. The fadeOutEffect runs for duration/2.
-            // So there's a race here.
-            // Better approach: Force clear any lingering chain before applying new one
-            // But only if it looks like the old one we were fading out.
-            // Actually, applyEffect calls clearEffect internally, so we are safe to just call fadeEffect.
-          }
-
+          // applyEffect (via fadeEffect) clears any lingering chain internally, and
+          // fadeOutEffect's cleanup timeout guards on chain identity, so applying
+          // the new effect here is safe regardless of which timer fired first.
           this.fadeEffect(key, newEffect, newEffectParams, duration / 2);
           Logger.success(`Effect cross-fade complete for ${key}: ${oldEffect} -> ${newEffect}`);
 
