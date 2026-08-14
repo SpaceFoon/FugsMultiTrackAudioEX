@@ -73,14 +73,27 @@ global.DataManager = {
   setupNewGame() {},
 };
 global.Scene_Title = { prototype: { start() {} } };
-global.Scene_Map = { prototype: { update() {}, create() {}, terminate() {} } };
+global.Scene_Map = { prototype: { update() {}, create() {}, start() {}, terminate() {} } };
 global.Scene_Battle = { prototype: { terminate() {} } };
-global.Scene_Menu = { prototype: { start() {}, terminate() {} } };
+function Scene_MenuBase() {}
+Scene_MenuBase.prototype.start = function () {};
+Scene_MenuBase.prototype.terminate = function () {};
+global.Scene_MenuBase = Scene_MenuBase;
+function Scene_Menu() {}
+Scene_Menu.prototype = Object.create(Scene_MenuBase.prototype);
+Scene_Menu.prototype.constructor = Scene_Menu;
+Scene_Menu.prototype.start = function () {};
+Scene_Menu.prototype.terminate = function () {};
+global.Scene_Menu = Scene_Menu;
+function Scene_Gameover() {}
+Scene_Gameover.prototype.start = function () {};
+global.Scene_Gameover = Scene_Gameover;
 global.Game_Interpreter = { prototype: { pluginCommand() {} } };
 global.WebAudio = {
   _context: {
     currentTime: 0,
     sampleRate: 44100,
+    createGain: () => makeNode(),
     createAnalyser: () => ({
       fftSize: 2048,
       getFloatTimeDomainData() {},

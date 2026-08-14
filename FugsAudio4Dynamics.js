@@ -51,9 +51,90 @@
   }
 
   if (!hub.sidechainConnections) hub.sidechainConnections = new Map();
+  if (!hub._duckRestoreTimeouts) hub._duckRestoreTimeouts = new Map();
   if (!hub.pumpConfig) {
     hub.pumpConfig = { active: false, bpm: 120, depth: 0, shape: "sine", tracks: "all", startTime: 0 };
   }
+
+  let pumpRafId = null;
+
+  hub._startPumpRaf = function() {
+    if (pumpRafId != null) return;
+    const tick = () => {
+      if (!this.pumpConfig || !this.pumpConfig.active) {
+        pumpRafId = null;
+        return;
+      }
+      this.updatePump();
+      pumpRafId = requestAnimationFrame(tick);
+    };
+    pumpRafId = requestAnimationFrame(tick);
+  };
+
+  hub._stopPumpRaf = function() {
+    if (pumpRafId != null) {
+      try {
+        cancelAnimationFrame(pumpRafId);
+      } catch (_e) {}
+      pumpRafId = null;
+    }
+  };
+
+  // B23: re-attach sidechain analyser taps after gain-node rewiring.
+  hub._reconnectSidechainAnalyserTaps = function(buffer) {
+    if (!buffer || !buffer._gainNode || !this.sidechainConnections) return;
+    for (const conn of this.sidechainConnections.values()) {
+      if (!conn || !conn.active || !conn.analyzer || conn.sourceTrack !== buffer) continue;
+      try {
+        buffer._gainNode.connect(conn.analyzer);
+      } catch (_e) {
+        Logger.debugOnce(
+          "reconnectSidechainAnalyserTaps: connect failed",
+          {},
+          "reconnectSidechainAnalyserTaps.connect"
+        );
+      }
+    }
+  };
+
+  // B27: sidechain duck multiplier on a dedicated series node (not MV _gainNode.gain).
+  hub.ensureSidechainGainNode = function(buffer) {
+    if (!buffer || !buffer._gainNode) return false;
+    if (buffer._sidechainGainNode) return true;
+    if (!WebAudio._context) return false;
+
+    try {
+      buffer._sidechainGainNode = WebAudio._context.createGain();
+      buffer._sidechainGainNode.gain.value = 1.0;
+
+      const gain = buffer._gainNode;
+      const panner = buffer._pannerNode;
+      const pump = buffer._pumpGainNode;
+      const duck = buffer._sidechainGainNode;
+
+      if (pump) {
+        try {
+          gain.disconnect(pump);
+        } catch (_e) {}
+        gain.connect(duck);
+        duck.connect(pump);
+      } else if (panner) {
+        try {
+          gain.disconnect(panner);
+        } catch (_e) {}
+        gain.connect(duck);
+        duck.connect(panner);
+      } else {
+        // Tests / buffers without a panner: still own a duck node in series.
+        gain.connect(duck);
+      }
+
+      return true;
+    } catch (e) {
+      Logger.error("Failed to create sidechain gain node", e);
+      return false;
+    }
+  };
 
   hub.ensurePumpNode = function(buffer) {
       if (!buffer || !buffer._gainNode || !buffer._pannerNode) return false;
@@ -61,24 +142,34 @@
       if (!WebAudio._context) return false;
 
       try {
-        // Create pump gain node
         buffer._pumpGainNode = WebAudio._context.createGain();
         buffer._pumpGainNode.gain.value = 1.0;
 
-        // Insert: gainNode -> pumpGainNode -> pannerNode
-        // We disconnect gainNode (which connects to pannerNode in standard MV)
-        // and insert our node in between.
-        try {
-          buffer._gainNode.disconnect();
-        } catch (_) {
-          Logger.debugOnce(
-            "ensurePumpNode: gainNode already disconnected",
-            {},
-            "ensurePumpNode.disconnectGain"
-          );
+        const gain = buffer._gainNode;
+        const panner = buffer._pannerNode;
+        const sidechain = buffer._sidechainGainNode;
+        const pump = buffer._pumpGainNode;
+
+        // B23: disconnect only the audibility edge, not every gain output (preserves analyser taps).
+        if (sidechain) {
+          try {
+            sidechain.disconnect(panner);
+          } catch (_e) {}
+          sidechain.connect(pump);
+        } else {
+          try {
+            gain.disconnect(panner);
+          } catch (_e) {
+            Logger.debugOnce(
+              "ensurePumpNode: gainNode->panner disconnect failed",
+              {},
+              "ensurePumpNode.disconnectGainPanner"
+            );
+          }
+          gain.connect(pump);
         }
-        buffer._gainNode.connect(buffer._pumpGainNode);
-        buffer._pumpGainNode.connect(buffer._pannerNode);
+        pump.connect(panner);
+        this._reconnectSidechainAnalyserTaps(buffer);
 
         return true;
       } catch (e) {
@@ -86,6 +177,61 @@
         return false;
       }
     };
+
+  hub._trackDuckRestoreTimeout = function(key, timeoutId) {
+    if (!this._duckRestoreTimeouts.has(key)) {
+      this._duckRestoreTimeouts.set(key, []);
+    }
+    this._duckRestoreTimeouts.get(key).push(timeoutId);
+  };
+
+  hub._clearDuckRestoreTimeouts = function(key) {
+    const ids = this._duckRestoreTimeouts.get(key);
+    if (!ids) return;
+    ids.forEach((timeoutId) => clearTimeout(timeoutId));
+    this._duckRestoreTimeouts.delete(key);
+  };
+
+  hub._applyDuckRestore = function(key, type, trackId, restoreVolume, fadeTime, buffer, duckGen) {
+    const currentBuffer = this.tracks.get(key);
+    if (!currentBuffer || currentBuffer !== buffer) {
+      Logger.warn(`Duck restore cancelled - track ${key} no longer exists or was replaced`);
+      return;
+    }
+    if (buffer._duckGen != null && duckGen != null && buffer._duckGen !== duckGen) {
+      return;
+    }
+
+    this._clearDuckRestoreTimeouts(key);
+    buffer._duckPendingRestore = null;
+
+    if (this.pausedTracks && this.pausedTracks.has(key)) {
+      const snap = this.pausedSnapshots && this.pausedSnapshots.get(key);
+      if (snap) {
+        snap.volume = restoreVolume;
+        if (snap.originalVolume != null) snap.originalVolume = restoreVolume;
+      }
+      buffer._pausedVolume = restoreVolume;
+      buffer.volume = restoreVolume;
+      buffer._manualVolume = restoreVolume;
+      Logger.info(
+        `Duck restore applied to paused snapshot for ${key}: ${Math.round(restoreVolume * 100)}%`
+      );
+      return;
+    }
+
+    Logger.info(
+      `Starting duck restore for ${key}: -> ${Math.round(restoreVolume * 100)}% over ${fadeTime}s`
+    );
+    this.fadeAudio(
+      type,
+      trackId,
+      { volume: restoreVolume * 100, duration: fadeTime },
+      () => {
+        Logger.success(`Duck restore complete for ${key}`);
+      }
+    );
+  };
 
   hub.updatePump = function() {
       if (!this.pumpConfig.active) return;
@@ -170,6 +316,12 @@
           return false;
         }
 
+        // B27: dedicated duck gain on the target before the envelope loop runs.
+        if (!this.ensureSidechainGainNode(targetTrack)) {
+          Logger.warn("Sidechain setup failed: could not insert sidechain gain node on target");
+          return false;
+        }
+
         // Create analyzer for source (envelope follower)
         const context = WebAudio._context;
         const analyzer = context.createAnalyser();
@@ -235,13 +387,9 @@
               currentGain = targetGain + releaseCoeff * (currentGain - targetGain);
             }
 
-            // Apply gain to target track
-            if (targetTrack._gainNode) {
-              const baseVolume =
-                targetTrack.volume !== undefined && targetTrack.volume !== null
-                  ? targetTrack.volume
-                  : 0.9;
-              targetTrack._gainNode.gain.setValueAtTime(currentGain * baseVolume, now);
+            // B27: duck multiplier on dedicated sidechain gain (MV volume stays on _gainNode).
+            if (this.ensureSidechainGainNode(targetTrack)) {
+              targetTrack._sidechainGainNode.gain.setValueAtTime(currentGain, now);
             }
 
             // Continue processing if still active AND tracks still exist
@@ -353,22 +501,18 @@
         );
       }
 
-      // Restore target volume safely.
+      // Restore sidechain duck multiplier (MV volume untouched).
       if (restoreTarget) {
         try {
-          if (connection.targetTrack && connection.targetTrack._gainNode && WebAudio._context) {
-            const baseVolume =
-              connection.targetTrack.volume !== undefined && connection.targetTrack.volume !== null
-                ? connection.targetTrack.volume
-                : 0.9;
-            connection.targetTrack._gainNode.gain.setValueAtTime(
-              baseVolume,
+          if (connection.targetTrack && connection.targetTrack._sidechainGainNode && WebAudio._context) {
+            connection.targetTrack._sidechainGainNode.gain.setValueAtTime(
+              1.0,
               WebAudio._context.currentTime
             );
           }
         } catch (_e) {
           Logger.debugOnce(
-            "disposeSidechain: restore target volume failed",
+            "disposeSidechain: restore target sidechain gain failed",
             {},
             "disposeSidechain.restoreTarget"
           );
@@ -450,49 +594,33 @@
           )}% -> ${duckLevel * 100}% for ${holdTime}s`
         );
 
+        const duckGen = (buffer._duckGen || 0) + 1;
+        buffer._duckGen = duckGen;
+        buffer._duckRestoreVolume = restoreVolume;
+        buffer._duckPendingRestore = {
+          type,
+          trackId,
+          restoreVolume,
+          fadeTime,
+          duckGen,
+        };
+
+        const runRestore = () => {
+          this._applyDuckRestore(key, type, trackId, restoreVolume, fadeTime, buffer, duckGen);
+        };
+
+        // B33/B35: hold + safety restores live outside activeTimeouts (survive pause; resilient to cancelFade).
+        if (holdTime > 0) {
+          const safetyMs = Math.max(50, (fadeTime + holdTime + fadeTime + 0.05) * 1000);
+          const safetyId = setTimeout(runRestore, safetyMs);
+          this._trackDuckRestoreTimeout(key, safetyId);
+        }
+
         this.fadeAudio(type, trackId, { volume: duckLevel * 100, duration: fadeTime }, () => {
           if (holdTime > 0) {
             Logger.success(`Duck phase complete for ${key}, holding for ${holdTime}s`);
-            const timeoutId = setTimeout(() => {
-              // Check if track still exists and wasn't replaced
-              const currentBuffer = this.tracks.get(key);
-              if (!currentBuffer) {
-                Logger.warn(`Duck restore cancelled - track ${key} no longer exists`);
-                return;
-              }
-
-              if (currentBuffer !== buffer) {
-                Logger.warn(`Duck restore cancelled - track ${key} was replaced`);
-                return;
-              }
-
-              Logger.info(
-                `Starting duck restore for ${key}: ${
-                  duckLevel * 100
-                }% -> ${Math.round(restoreVolume * 100)}%`
-              );
-              this.fadeAudio(
-                type,
-                trackId,
-                { volume: restoreVolume * 100, duration: fadeTime },
-                () => {
-                  Logger.success(`Duck restore complete for ${key}`);
-                  // Remove timeout from tracking
-                  if (this.activeTimeouts.has(key)) {
-                    const timeouts = this.activeTimeouts.get(key);
-                    const index = timeouts.indexOf(timeoutId);
-                    if (index > -1) timeouts.splice(index, 1);
-                    if (timeouts.length === 0) this.activeTimeouts.delete(key);
-                  }
-                }
-              );
-            }, holdTime * 1000);
-
-            // Track this timeout for cleanup
-            if (!this.activeTimeouts.has(key)) {
-              this.activeTimeouts.set(key, []);
-            }
-            this.activeTimeouts.get(key).push(timeoutId);
+            const holdId = setTimeout(runRestore, holdTime * 1000);
+            this._trackDuckRestoreTimeout(key, holdId);
           }
         });
       }
@@ -572,6 +700,9 @@
           Logger.info(`Skipping sidechain exception: ${key}`);
           continue;
         }
+
+        // B32: skip paused tracks (same guard as duckAllAudio / B13).
+        if (this.pausedTracks && this.pausedTracks.has(key)) continue;
 
         const [type, trackId] = key.split("_");
         if (this.duckVolume(type, trackId, duckLevel, fadeTime, holdTime, switchId)) {
@@ -661,6 +792,7 @@
         tracks: opts.tracks != null ? opts.tracks : "all",
         startTime: performance.now(),
       };
+      this._startPumpRaf();
       Logger.info(
         `Started rhythmic pump: ${this.pumpConfig.bpm}bpm, ${this.pumpConfig.shape}, depth ${this.pumpConfig.depth} on ${this.pumpConfig.tracks}`
       );
@@ -669,6 +801,7 @@
 
   hub.stopPump = function() {
       this.pumpConfig.active = false;
+      this._stopPumpRaf();
       for (const buffer of this.tracks.values()) {
         if (buffer._pumpGainNode) {
           buffer._pumpGainNode.gain.value = 1.0;
@@ -696,11 +829,13 @@
     const shape = args[2] || AUDIO_CONSTANTS.DEFAULT_PUMP_SHAPE;
     const tracks = args[3] || "all";
     this.pumpConfig = { active: true, bpm, depth, shape, tracks, startTime: performance.now() };
+    this._startPumpRaf();
     Logger.info("Started rhythmic pump: " + bpm + "bpm, " + shape + ", depth " + depth + " on " + tracks);
     return true;
   });
   hub.registerHandler("stoppump", function () {
     this.pumpConfig.active = false;
+    this._stopPumpRaf();
     for (const buffer of this.tracks.values()) {
       if (buffer._pumpGainNode) buffer._pumpGainNode.gain.value = 1.0;
     }
@@ -748,10 +883,17 @@
   });
 
   hub.onUpdate(function () {
+    // B42: RAF drives pump in all scenes; map onUpdate is an extra tick only.
     if (this.pumpConfig && this.pumpConfig.active) this.updatePump();
   });
 
   hub.onTeardown(function (key) {
+    this._clearDuckRestoreTimeouts(key);
+    const pendingBuffer = this.tracks.get(key);
+    if (pendingBuffer) {
+      pendingBuffer._duckPendingRestore = null;
+      delete pendingBuffer._duckRestoreVolume;
+    }
     if (key.startsWith("bgm_") && this.sidechainConnections) {
       const trackId = key.substring(4);
       for (const [connKey, conn] of Array.from(this.sidechainConnections.entries())) {
@@ -763,6 +905,12 @@
       }
     }
     const buffer = this.tracks.get(key);
+    if (buffer && buffer._sidechainGainNode) {
+      try {
+        buffer._sidechainGainNode.disconnect();
+      } catch (_e) {}
+      buffer._sidechainGainNode = null;
+    }
     if (buffer && buffer._pumpGainNode) {
       try {
         buffer._pumpGainNode.disconnect();
@@ -848,6 +996,7 @@
   hub.onRestoreGlobalState(function (meta) {
     if (!meta || !meta.pump || !meta.pump.active) {
       if (this.pumpConfig) this.pumpConfig.active = false;
+      this._stopPumpRaf();
       return;
     }
     const p = meta.pump;
@@ -860,6 +1009,7 @@
       // Reset phase so restore doesn't jump mid-cycle from a stale startTime.
       startTime: typeof performance !== "undefined" && performance.now ? performance.now() : Date.now(),
     };
+    this._startPumpRaf();
     Logger.info(
       "Restored rhythmic pump: " +
         this.pumpConfig.bpm +
@@ -871,6 +1021,34 @@
         this.pumpConfig.tracks
     );
   });
+
+  if (!hub._dynamicsResumeWrapped) {
+    hub._dynamicsResumeWrapped = true;
+    const origResume = hub.resumeAudio;
+    hub.resumeAudio = function(type, trackId, args) {
+      const key = `${type}_${trackId}`;
+      const pendingBefore = this.tracks.get(key) && this.tracks.get(key)._duckPendingRestore;
+      const result = origResume.apply(this, arguments);
+      const buffer = this.tracks.get(key);
+      if (
+        buffer &&
+        pendingBefore &&
+        buffer._duckPendingRestore &&
+        !(this.pausedTracks && this.pausedTracks.has(key))
+      ) {
+        const snap = this.pausedSnapshots && this.pausedSnapshots.get(key);
+        if (
+          snap &&
+          pendingBefore.restoreVolume != null &&
+          Math.abs(snap.volume - pendingBefore.restoreVolume) < 1e-6
+        ) {
+          buffer.volume = pendingBefore.restoreVolume;
+          buffer._manualVolume = pendingBefore.restoreVolume;
+        }
+      }
+      return result;
+    };
+  }
 
   Logger.success(TAG + " loaded — duck / pump / sidechain / pitchbendall ready");
 })();

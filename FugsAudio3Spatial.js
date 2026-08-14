@@ -162,6 +162,69 @@
   if (!hub.proximityData) hub.proximityData = new Map();
   if (!hub.panSweeps) hub.panSweeps = new Map();
   if (!hub.proximityErrors) hub.proximityErrors = new Set();
+  if (!hub._proximityDeferVolumeUntilPause) hub._proximityDeferVolumeUntilPause = new Set();
+
+  hub._currentProximityMapId = null;
+
+  hub._resolveProximityMapId = function () {
+    if (typeof $gameMap === "undefined" || !$gameMap || typeof $gameMap.mapId !== "function") {
+      return null;
+    }
+    return $gameMap.mapId();
+  };
+
+  // B31: event-bound proximity is map-local — drop stale bindings after map transfer.
+  hub.revalidateEventProximityForMap = function () {
+    if (!this.proximityData || this.proximityData.size === 0) return;
+
+    const currentMapId = this._resolveProximityMapId();
+    this._currentProximityMapId = currentMapId;
+
+    for (const [key, config] of this.proximityData.entries()) {
+      if (!config || !config.eventId) continue;
+
+      if (currentMapId == null || config.mapId == null || config.mapId !== currentMapId) {
+        config.eventMapStale = true;
+        if (this.proximityErrors) {
+          const prefix = key + "_";
+          const filtered = new Set();
+          for (const errorKey of this.proximityErrors) {
+            if (!errorKey.startsWith(prefix)) filtered.add(errorKey);
+          }
+          this.proximityErrors = filtered;
+        }
+      } else {
+        config.eventMapStale = false;
+      }
+    }
+  };
+
+  // B36: do not overwrite silent fade-in starts; B45: defer while pause is pending.
+  hub._shouldSkipProximityVolumeWrite = function (key, buffer) {
+    if (!buffer) return true;
+
+    if (this._proximityDeferVolumeUntilPause && this._proximityDeferVolumeUntilPause.has(key)) {
+      if (!(this.pausedTracks && this.pausedTracks.has(key))) {
+        return true;
+      }
+      this._proximityDeferVolumeUntilPause.delete(key);
+    }
+
+    const volumeFadeKey = `${key}_volume`;
+    if (FadeManager.activeFades.has(volumeFadeKey)) return true;
+
+    if (typeof buffer.isReady === "function" && !buffer.isReady()) return true;
+
+    const manual =
+      buffer._manualVolume !== undefined && buffer._manualVolume !== null
+        ? buffer._manualVolume
+        : buffer._originalVolume;
+    if (buffer.volume === 0 && typeof manual === "number" && isFinite(manual) && manual > 0) {
+      return true;
+    }
+
+    return false;
+  };
 
   hub.parseProximityConfig = function(str) {
       // Flexible parser that supports nested arrays/objects and quoted strings.
@@ -277,10 +340,16 @@
         }
       }
 
+      const parsedEventId = config.event != null ? parseInt(config.event, 10) : undefined;
+      const hasEventBinding =
+        parsedEventId != null && Number.isInteger(parsedEventId) && parsedEventId >= 1;
+
       const proximityConfig = {
         x: config.x,
         y: config.y,
-        eventId: config.event != null ? parseInt(config.event, 10) : undefined,
+        eventId: hasEventBinding ? parsedEventId : undefined,
+        mapId: hasEventBinding ? this._resolveProximityMapId() : undefined,
+        eventMapStale: false,
         followPlayer: config.player,
         maxDistance:
           config.maxDistance !== undefined && config.maxDistance !== null
@@ -320,6 +389,11 @@
       if (typeof $dataMap === "undefined" || !$dataMap) return;
       if (typeof $gameMap === "undefined" || !$gameMap) return;
 
+      const currentMapId = this._resolveProximityMapId();
+      if (currentMapId != null && currentMapId !== this._currentProximityMapId) {
+        this.revalidateEventProximityForMap();
+      }
+
       const playerX = $gamePlayer.x;
       const playerY = $gamePlayer.y;
 
@@ -333,6 +407,17 @@
           sourceX = playerX;
           sourceY = playerY;
         } else if (config.eventId) {
+          if (config.eventMapStale) {
+            continue;
+          }
+          if (
+            config.mapId != null &&
+            currentMapId != null &&
+            config.mapId !== currentMapId
+          ) {
+            config.eventMapStale = true;
+            continue;
+          }
           try {
             // Validate event ID
             if (!Number.isInteger(config.eventId) || config.eventId < 1) {
@@ -460,10 +545,8 @@
           volumeMultiplier = curveFunc(distance, config.maxDistance);
         }
 
-        // Skip proximity volume control if a fade is in progress for this track
-        // This prevents proximity from overriding crossfades and other volume animations
-        const volumeFadeKey = `${key}_volume`;
-        if (!FadeManager.activeFades.has(volumeFadeKey)) {
+        // B36: skip volume writes while cold, fade-in is pending, or a fade is active.
+        if (!this._shouldSkipProximityVolumeWrite(key, buffer)) {
           const baseVolumeCandidate =
             buffer._manualVolume !== undefined && buffer._manualVolume !== null
               ? buffer._manualVolume
@@ -694,6 +777,7 @@
       FadeManager.cancelFade(key + "_pan");
     }
     if (this.proximityData) this.proximityData.delete(key);
+    if (this._proximityDeferVolumeUntilPause) this._proximityDeferVolumeUntilPause.delete(key);
     if (this.proximityErrors) {
       const prefix = key + "_";
       const filtered = new Set();
@@ -714,6 +798,7 @@
         x: cfg.x,
         y: cfg.y,
         eventId: cfg.eventId,
+        mapId: cfg.mapId,
         followPlayer: cfg.followPlayer,
         maxDistance: cfg.maxDistance,
         minVolume: cfg.minVolume,
@@ -754,9 +839,29 @@
         lastSourceY: undefined,
         lastTargetX: undefined,
         lastTargetY: undefined,
+        eventMapStale: false,
       });
+      if (restored.eventId) {
+        const currentMapId = this._resolveProximityMapId();
+        if (
+          restored.mapId == null ||
+          currentMapId == null ||
+          restored.mapId !== currentMapId
+        ) {
+          restored.eventMapStale = true;
+        }
+      }
       this.proximityData.set(key, restored);
-      if (typeof this.updateProximityVolume === "function") {
+      const buffer = this.tracks.get(key);
+      const pausePending =
+        (this.pausedTracks && this.pausedTracks.has(key)) ||
+        (this.pausedSnapshots && this.pausedSnapshots.has(key)) ||
+        (buffer && typeof buffer.isReady === "function" && !buffer.isReady());
+      // B45: restore proximity data only — applying volume while paused (or before a
+      // deferred cold pause snapshots buffer.volume) causes double attenuation on resume.
+      if (pausePending) {
+        this._proximityDeferVolumeUntilPause.add(key);
+      } else if (typeof this.updateProximityVolume === "function") {
         try {
           this.updateProximityVolume();
         } catch (e) {
@@ -791,6 +896,16 @@
       }
     }
   });
+
+  if (typeof Scene_Map !== "undefined" && Scene_Map.prototype) {
+    const _Spatial_Scene_Map_create = Scene_Map.prototype.create;
+    Scene_Map.prototype.create = function () {
+      if (typeof _Spatial_Scene_Map_create === "function") {
+        _Spatial_Scene_Map_create.call(this);
+      }
+      hub.revalidateEventProximityForMap();
+    };
+  }
 
   window.DistanceCurves = DistanceCurves;
   hub.DistanceCurves = DistanceCurves;

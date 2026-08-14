@@ -4802,6 +4802,372 @@ TestRunner.add("stress:chaos", async function () {
 });
 
 // =====================================================================
+// BUG-FIX REGRESSION TESTS (B17–B46) — assert fixed behavior once slices land
+// =====================================================================
+
+TestRunner.add("fix:B17-loadLeftovers", async function () {
+  await this.cleanup();
+  console.log("Testing B17: load restore stops tracks absent from snapshot...");
+
+  const bgm = this.tracks.pick("bgm");
+  const bgs = this.tracks.pick("bgs");
+  if (!bgm || !bgs) {
+    this.skip("Need bgm + bgs files for load leftover test");
+    return;
+  }
+
+  await this.ensureTrack("bgm", 1, bgm);
+  FugsAudio.save("auto");
+  await this.ensureTrack("bgs", 17, bgs);
+  this.assert(FugsAudio.tracks.has("bgs_17"), "Leftover session track exists before load restore");
+
+  FugsAudio.loadAllStates("auto");
+  await this.wait(300);
+
+  this.assert(FugsAudio.tracks.has("bgm_1"), "Snapshot track bgm_1 restored");
+  this.assert(!FugsAudio.tracks.has("bgs_17"), "Leftover bgs_17 stopped on load restore");
+});
+
+TestRunner.add("fix:B18-sceneResume", async function () {
+  await this.cleanup();
+  console.log("Testing B18: pauseMode:scene resumes after map entry...");
+
+  const name = this.tracks.pick("bgm");
+  if (!name) {
+    this.skip("No BGM files for scene resume test");
+    return;
+  }
+
+  await this.ensureTrack("bgm", 18, name, { persistence: "always", pauseMode: "scene" });
+  FugsAudio.handleSceneTransition("scene", 0);
+  this.assert(FugsAudio.pausedTracks.has("bgm_18"), "Scene transition pauses pauseMode:scene track");
+
+  if (typeof FugsAudio._resumeSceneModeTracks === "function") {
+    FugsAudio._resumeSceneModeTracks();
+  } else if (typeof Scene_Map !== "undefined" && Scene_Map.prototype.start) {
+    Scene_Map.prototype.start.call({});
+  } else {
+    this.skip("No scene resume hook (_resumeSceneModeTracks / Scene_Map.start)");
+    return;
+  }
+
+  this.assert(!FugsAudio.pausedTracks.has("bgm_18"), "Scene-paused track resumes after map start");
+});
+
+TestRunner.add("fix:B20-gameover", async function () {
+  await this.cleanup();
+  console.log("Testing B20: Game Over stops Fugs audio...");
+
+  if (typeof Scene_Gameover === "undefined") {
+    // MV defines Scene_Gameover only when the class is loaded; verify hook via source if needed.
+    this.skip("Scene_Gameover not available — hook must be added in core slice");
+    return;
+  }
+
+  const startFn = Scene_Gameover.prototype.start;
+  const hooked =
+    typeof startFn === "function" &&
+    /stopAll|resetRuntime|handleSceneTransition/.test(startFn.toString());
+  this.assert(hooked, "Scene_Gameover.start hooks Fugs stop (stopAll / resetRuntime / handleSceneTransition)");
+
+  const name = this.tracks.pick("bgm");
+  if (!name) {
+    this.skip("No BGM files for gameover runtime check");
+    return;
+  }
+
+  await this.ensureTrack("bgm", 20, name);
+  this.assert(FugsAudio.tracks.size > 0, "Track playing before gameover");
+
+  if (hooked) {
+    try {
+      Scene_Gameover.prototype.start.call({});
+    } catch (e) {
+      Logger.debugOnce("fix:B20 start call", { error: e && e.message ? e.message : e }, "fix:B20");
+    }
+    await this.wait(200);
+    this.assert(FugsAudio.tracks.size === 0, "Game Over start stops all Fugs tracks");
+  }
+});
+
+TestRunner.add("fix:B25-resetRuntime", async function () {
+  await this.cleanup();
+  console.log("Testing B25: resetRuntime / New Game clears mixer + satellite state...");
+
+  this.assert(typeof FugsAudio.resetRuntime === "function", "resetRuntime API exists");
+
+  const bgm = this.tracks.pick("bgm");
+  if (!bgm) {
+    this.skip("No BGM files for resetRuntime test");
+    return;
+  }
+
+  await this.ensureTrack("bgm", 25, bgm, { persistence: "scene", pauseMode: "never" });
+  const aliasName = "FixB25Reset";
+  FugsAudio.unregisterAlias(aliasName);
+  FugsAudio.registerAlias(aliasName, { pool: [bgm], cooldown: 0 });
+  this.assert(FugsAudio.sfxAliases.has(aliasName), "Alias registered before reset");
+
+  FugsAudio.resetRuntime({ stop: true });
+  this.assert(FugsAudio.tracks.size === 0, "resetRuntime clears live tracks");
+  this.assert(!FugsAudio.sfxAliases.has(aliasName), "resetRuntime clears sfxAliases");
+
+  if (typeof DataManager !== "undefined" && typeof DataManager.setupNewGame === "function") {
+    await this.ensureTrack("bgm", 25, bgm, { persistence: "scene", pauseMode: "never" });
+    DataManager.setupNewGame();
+    await this.wait(200);
+    this.assert(!FugsAudio.tracks.has("bgm_25"), "setupNewGame does not leave persistence:scene tracks playing");
+  }
+
+  FugsAudio.unregisterAlias(aliasName);
+});
+
+TestRunner.add("fix:B29-syncplayType", async function () {
+  console.log("Testing B29: dashless syncplay uses bgm, not type all...");
+
+  const parsed = FugsAudio.parseCommand("syncplay", ["Drums", "Bass"]);
+  this.assert(parsed !== null, "dashless syncplay command parses");
+  const parserOk = parsed.type === "bgm" || parsed.type !== "all";
+  this.assert(parserOk, `Parser defaults dashless syncplay away from type all (got ${parsed.type})`);
+
+  await this.cleanup();
+  const bgmTracks = this.tracks.all("bgm");
+  if (!bgmTracks || bgmTracks.length < 2) {
+    this.skip("Need at least 2 BGM files for syncplay type test");
+    return;
+  }
+
+  FugsAudio.syncPlay(parsed.type === "all" ? "all" : parsed.type, [bgmTracks[0], bgmTracks[1]]);
+  await this.wait(600);
+
+  this.assert(FugsAudio.tracks.has("bgm_1"), "syncplay creates bgm_1 stem slot");
+  this.assert(!FugsAudio.tracks.has("all_1"), "syncplay does not create all_1 keys");
+});
+
+TestRunner.add("fix:B32-sidechainPaused", async function () {
+  await this.cleanup();
+  console.log("Testing B32: duckall-sidechain skips paused tracks...");
+
+  if (typeof FugsAudio.sidechainDuck !== "function") {
+    this.skip("sidechainDuck requires FugsAudio4Dynamics");
+    return;
+  }
+
+  const bgm = this.tracks.pick("bgm");
+  if (!bgm) {
+    this.skip("No BGM files for sidechain paused test");
+    return;
+  }
+
+  const origDuck = FugsAudio.duckVolume;
+  const ducked = [];
+  FugsAudio.duckVolume = function (type, trackId) {
+    ducked.push(`${type}_${trackId}`);
+    return true;
+  };
+
+  await this.ensureTrack("bgm", 32, bgm);
+  FugsAudio.play("bgm", "32p", bgm, { volume: 90, fadein: 0, persistence: "always", pauseMode: "never" });
+  await this.wait(200);
+  FugsAudio.pausedTracks.add("bgm_32p");
+
+  FugsAudio.sidechainDuck([], ["0.3", "0", "0"]);
+  FugsAudio.duckVolume = origDuck;
+
+  this.assert(ducked.indexOf("bgm_32") !== -1, "sidechainDuck still hits active tracks");
+  this.assert(ducked.indexOf("bgm_32p") === -1, "sidechainDuck skips paused tracks");
+
+  FugsAudio.pausedTracks.delete("bgm_32p");
+});
+
+TestRunner.add("fix:B39-delayMax", async function () {
+  console.log("Testing B39: delay > 1s creates chain without throwing...");
+
+  if (!AudioEffects || typeof AudioEffects.createEffectChain !== "function") {
+    this.skip("AudioEffects not loaded");
+    return;
+  }
+
+  let chain = null;
+  let threw = false;
+  try {
+    chain = AudioEffects.createEffectChain("fix_b39_delay", [
+      { type: "delay", delay: 2, feedback: 0.4, wet: 0.5 },
+    ]);
+  } catch (e) {
+    threw = true;
+    Logger.debugOnce("fix:B39 throw", { error: e && e.message ? e.message : e }, "fix:B39");
+  }
+
+  this.assert(!threw, "delayTime 2s does not throw when building effect chain");
+  this.assert(chain != null, "delay effect chain is created for 2s delayTime");
+
+  if (chain && chain.nodes) {
+    const delayNode = chain.nodes.find((n) => n && n.delayTime);
+    if (delayNode) {
+      this.assert(delayNode.delayTime.value >= 2, "DelayNode maxDelay accommodates 2s delayTime");
+    }
+  }
+});
+
+TestRunner.add("fix:B40-fadeCurve", async function () {
+  console.log("Testing B40: positional fade curve (linear) is not mistaken for pan...");
+
+  const noTag = FugsAudio.checkCurve(["50", "2", "linear"]);
+  this.assert(
+    (noTag.curve === undefined || noTag.curve == null) && noTag.args.indexOf("linear") !== -1,
+    "checkCurve without (curve:) tag leaves positional name in args"
+  );
+
+  const parsed = FugsAudio.parseCommand("fade-bgm1", ["50", "2", "linear"]);
+  this.assert(parsed !== null, "fade-bgm1 50 2 linear parses");
+  this.assert(
+    parsed.curve === "linear" || (parsed.args[2] === "linear" && parsed.curve !== "smooth"),
+    "fade-bgm1 50 2 linear resolves to linear curve (not default smooth)"
+  );
+
+  await this.cleanup();
+  const name = this.tracks.pick("bgm");
+  if (!name) {
+    this.skip("No BGM files for fade curve runtime test");
+    return;
+  }
+
+  await this.ensureTrack("bgm", 40, name);
+  const origFade = FugsAudio.fadeAudio;
+  let fadeOpts = null;
+  FugsAudio.fadeAudio = function (type, trackId, opts, cb) {
+    fadeOpts = opts;
+    return origFade.call(this, type, trackId, opts, cb);
+  };
+
+  FugsAudio.executeCommand({
+    type: "bgm",
+    trackId: "40",
+    action: "fade",
+    args: ["50", "2", "linear"],
+    curve: parsed.curve,
+    persistence: FugsAudio.config.defaultPersistenceMode,
+    pauseMode: FugsAudio.config.defaultPauseMode,
+  });
+  FugsAudio.fadeAudio = origFade;
+
+  this.assert(!!fadeOpts, "executeCommand fade reached fadeAudio");
+  this.assert(fadeOpts.curve === "linear", "fade uses linear curve, not smooth default");
+  this.assert(fadeOpts.pan === undefined || fadeOpts.pan == null, "linear is not parsed as pan");
+
+  const fadeallParsed = FugsAudio.parseCommand("fadeall-bgm", ["50", "2", "(curve:linear)"]);
+  this.assert(fadeallParsed && fadeallParsed.curve === "linear", "fadeall parses (curve:linear)");
+
+  const origFadeAll = FugsAudio.fadeAudio;
+  let fadeAllOpts = null;
+  FugsAudio.fadeAudio = function (type, trackId, opts, cb) {
+    fadeAllOpts = opts;
+    return origFadeAll.call(this, type, trackId, opts, cb);
+  };
+  FugsAudio.fadeAllOfType("bgm", ["50", "2"], fadeallParsed.curve);
+  FugsAudio.fadeAudio = origFadeAll;
+  this.assert(!!fadeAllOpts && fadeAllOpts.curve === "linear", "fadeAllOfType forwards curve to fadeAudio");
+});
+
+TestRunner.add("fix:B41-aliasCooldownFail", async function () {
+  console.log("Testing B41: alias cooldown not consumed when playAudio fails...");
+
+  const aliasName = "FixB41Fail";
+  FugsAudio.unregisterAlias(aliasName);
+  const registered = FugsAudio.registerAlias(aliasName, { pool: ["MissingSound"], cooldown: 5000 });
+  this.assert(registered, "Alias registered for B41 test");
+
+  FugsAudio.aliasLastPlayed.set(aliasName, performance.now() - 60000);
+  const before = FugsAudio.aliasLastPlayed.get(aliasName);
+
+  const origPlay = FugsAudio.playAudio;
+  FugsAudio.playAudio = function () {
+    return false;
+  };
+  const result = FugsAudio.playAlias(aliasName, "se", "41");
+  const after = FugsAudio.aliasLastPlayed.get(aliasName);
+  FugsAudio.playAudio = origPlay;
+
+  this.assert(result === false, "playAlias returns false when playAudio fails");
+  this.assert(after === before, "aliasLastPlayed unchanged after failed playAudio");
+
+  FugsAudio.unregisterAlias(aliasName);
+});
+
+TestRunner.add("fix:B43-aliasFirstPlay", async function () {
+  console.log("Testing B43: first playAlias is not blocked by cooldown > performance.now()...");
+
+  const aliasName = "FixB43First";
+  FugsAudio.unregisterAlias(aliasName);
+  FugsAudio.registerAlias(aliasName, { pool: ["Step"], cooldown: 60 * 60 * 1000 });
+  FugsAudio.aliasLastPlayed.delete(aliasName);
+
+  const origPlay = FugsAudio.playAudio;
+  let playHits = 0;
+  FugsAudio.playAudio = function () {
+    playHits += 1;
+    return true;
+  };
+  const first = FugsAudio.playAlias(aliasName, "se", "43");
+  FugsAudio.playAudio = origPlay;
+
+  this.assert(first === true, "First playAlias succeeds immediately after boot");
+  this.assert(playHits === 1, "playAudio reached on first alias play");
+  this.assert(
+    FugsAudio.aliasLastPlayed.has(aliasName),
+    "aliasLastPlayed recorded after successful first play"
+  );
+
+  FugsAudio.unregisterAlias(aliasName);
+});
+
+TestRunner.add("fix:B46-syncPlayPolicy", async function () {
+  await this.cleanup();
+  console.log("Testing B46: syncPlay honors (p:) and (pause:) tags...");
+
+  const parsed = FugsAudio.parseCommand("syncplay-bgm", [
+    "Drums",
+    "Bass",
+    "(p:always)",
+    "(pause:never)",
+  ]);
+  this.assert(parsed !== null, "syncplay-bgm with policy tags parses");
+  this.assert(parsed.persistence === "always", "parseCommand keeps (p:always)");
+  this.assert(parsed.pauseMode === "never", "parseCommand keeps (pause:never)");
+
+  const bgmTracks = this.tracks.all("bgm");
+  if (!bgmTracks || bgmTracks.length < 2) {
+    this.skip("Need at least 2 BGM files for syncPlay policy test");
+    return;
+  }
+
+  const cmd = {
+    type: "bgm",
+    trackId: "1",
+    action: "syncplay",
+    args: [bgmTracks[0], bgmTracks[1]],
+    persistence: parsed.persistence,
+    pauseMode: parsed.pauseMode,
+  };
+  FugsAudio.executeCommand(cmd);
+  await this.wait(600);
+
+  const stems = ["bgm_1", "bgm_2"]
+    .map((k) => FugsAudio.tracks.get(k))
+    .filter(Boolean);
+  this.assert(stems.length >= 1, "syncPlay created at least one stem");
+  this.assert(
+    stems.every((b) => b._persistence === "always"),
+    "syncPlay stems use (p:always), not factory default"
+  );
+  this.assert(
+    stems.every((b) => b._pauseMode === "never"),
+    "syncPlay stems use (pause:never), not factory default"
+  );
+});
+
+// =====================================================================
 // COVERAGE REPORT
 // =====================================================================
 TestRunner.add("coverage", async function () {
@@ -4917,6 +5283,8 @@ TestRunner.add("coverage", async function () {
       "checkPauseMode",
       "parseArguments",
       "handleSceneTransition",
+      "resetRuntime",
+      "_resumeSceneModeTracks",
       "cleanupOrphanedTracks",
       "stopAllOfType",
       "stopAll",
@@ -4973,7 +5341,7 @@ TestRunner.add("coverage", async function () {
     "AudioEffects.init": [],
     "AudioEffects.toNum": ["unit:toNumParity"],
     "AudioEffects.validateBuffer": ["unit:validateBuffer"],
-    "AudioEffects.createEffectChain": ["effect", "effect:fadein", "preset", "preset:all"],
+    "AudioEffects.createEffectChain": ["effect", "effect:fadein", "preset", "preset:all", "fix:B39-delayMax"],
     "AudioEffects.createDistortionCurve": [],
     "AudioEffects._addToCache": [],
     "AudioEffects.createBitcrusherCurve": [],
@@ -5040,11 +5408,11 @@ TestRunner.add("coverage", async function () {
     "FugsMultiTrackAudioEX.updatePump": ["stress:chaos"],
     "FugsMultiTrackAudioEX.registerAlias": [],
     "FugsMultiTrackAudioEX.unregisterAlias": [],
-    "FugsMultiTrackAudioEX.playAlias": [],
+    "FugsMultiTrackAudioEX.playAlias": ["pool:create", "pool:reuse", "fix:B41-aliasCooldownFail", "fix:B43-aliasFirstPlay"],
     "FugsMultiTrackAudioEX.listAliases": [],
     "FugsMultiTrackAudioEX.parseProximityConfig": ["unit:parseProximityConfig"],
     "FugsMultiTrackAudioEX.parseAliasConfig": ["unit:parseAliasConfig"],
-    "FugsMultiTrackAudioEX.executeCommand": ["unit:command", "stress:chaos"],
+    "FugsMultiTrackAudioEX.executeCommand": ["unit:command", "stress:chaos", "fix:B40-fadeCurve", "fix:B46-syncPlayPolicy"],
     "FugsMultiTrackAudioEX.playAudio": [
       "play",
       "play:multi",
@@ -5060,7 +5428,7 @@ TestRunner.add("coverage", async function () {
       "stress:play:many",
       "stress:play:burst",
     ],
-    "FugsMultiTrackAudioEX.syncPlay": [],
+    "FugsMultiTrackAudioEX.syncPlay": ["fix:B29-syncplayType", "fix:B46-syncPlayPolicy"],
     "FugsMultiTrackAudioEX.startSyncedBuffers": [],
     "FugsMultiTrackAudioEX.setupSidechain": [],
     "FugsMultiTrackAudioEX._disposeSidechainConnection": [],
@@ -5086,11 +5454,11 @@ TestRunner.add("coverage", async function () {
       "stress:fade:rapid",
     ],
     "FugsMultiTrackAudioEX.fadeAllAudio": [],
-    "FugsMultiTrackAudioEX.fadeAllOfType": [],
+    "FugsMultiTrackAudioEX.fadeAllOfType": ["fix:B40-fadeCurve"],
     "FugsMultiTrackAudioEX.duckVolume": ["duck", "stress:duck:overlapping"],
     "FugsMultiTrackAudioEX.duckAllOfType": [],
     "FugsMultiTrackAudioEX.duckAllAudio": ["duck:all"],
-    "FugsMultiTrackAudioEX.sidechainDuck": [],
+    "FugsMultiTrackAudioEX.sidechainDuck": ["fix:B32-sidechainPaused"],
     "FugsMultiTrackAudioEX.pitchBendAll": [],
     "FugsMultiTrackAudioEX.pitchBendAllOfType": [],
     "FugsMultiTrackAudioEX.startPanSweep": [],
@@ -5136,7 +5504,7 @@ TestRunner.add("coverage", async function () {
     "FugsMultiTrackAudioEX.captureTrackState": ["save"],
     "FugsMultiTrackAudioEX.saveAllStates": ["save"],
     "FugsMultiTrackAudioEX.loadTrackState": ["load"],
-    "FugsMultiTrackAudioEX.loadAllStates": ["load"],
+    "FugsMultiTrackAudioEX.loadAllStates": ["load", "fix:B17-loadLeftovers"],
     "FugsMultiTrackAudioEX.getSaveData": ["save"],
     "FugsMultiTrackAudioEX.applySaveData": ["load"],
     "FugsMultiTrackAudioEX.parseCommand": ["unit:parse", "unit:command", "unit:parseClassic"],
@@ -5149,14 +5517,16 @@ TestRunner.add("coverage", async function () {
       "unit:loop",
       "unit:loopFull",
     ],
-    "FugsMultiTrackAudioEX.checkCurve": ["unit:consumeParenTag", "unit:modifiers"],
+    "FugsMultiTrackAudioEX.checkCurve": ["unit:consumeParenTag", "unit:modifiers", "fix:B40-fadeCurve"],
     "FugsMultiTrackAudioEX.checkPersistence": ["unit:consumeParenTag", "unit:modifiers"],
     "FugsMultiTrackAudioEX.checkPauseMode": ["unit:consumeParenTag", "unit:modifiers"],
     "FugsMultiTrackAudioEX.parseArguments": ["unit:parseArguments"],
-    "FugsMultiTrackAudioEX.handleSceneTransition": [],
+    "FugsMultiTrackAudioEX.handleSceneTransition": ["fix:B18-sceneResume"],
+    "FugsMultiTrackAudioEX.resetRuntime": ["fix:B25-resetRuntime"],
+    "FugsMultiTrackAudioEX._resumeSceneModeTracks": ["fix:B18-sceneResume"],
     "FugsMultiTrackAudioEX.cleanupOrphanedTracks": ["memory"],
     "FugsMultiTrackAudioEX.stopAllOfType": ["stop:all"],
-    "FugsMultiTrackAudioEX.stopAll": ["stop:all", "stress:chaos"],
+    "FugsMultiTrackAudioEX.stopAll": ["stop:all", "stress:chaos", "fix:B20-gameover", "fix:B25-resetRuntime"],
     "FugsMultiTrackAudioEX.executeChain": [],
     "FugsMultiTrackAudioEX.listall": [],
     "FugsMultiTrackAudioEX.testCommand": [],

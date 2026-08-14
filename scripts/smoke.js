@@ -35,6 +35,8 @@ function makeBuffer(name, opts) {
   return {
     _name: name,
     _gainNode: makeNode(),
+    _pannerNode: makeNode(),
+    _sourceNode: makeNode(),
     _ready: opts.ready !== false,
     _loadListeners: [],
     _playing: false,
@@ -87,14 +89,27 @@ global.DataManager = {
   setupNewGame() {},
 };
 global.Scene_Title = { prototype: { start() {} } };
-global.Scene_Map = { prototype: { update() {}, create() {}, terminate() {} } };
+global.Scene_Map = { prototype: { update() {}, create() {}, start() {}, terminate() {} } };
 global.Scene_Battle = { prototype: { terminate() {} } };
-global.Scene_Menu = { prototype: { start() {}, terminate() {} } };
+function Scene_MenuBase() {}
+Scene_MenuBase.prototype.start = function () {};
+Scene_MenuBase.prototype.terminate = function () {};
+global.Scene_MenuBase = Scene_MenuBase;
+function Scene_Menu() {}
+Scene_Menu.prototype = Object.create(Scene_MenuBase.prototype);
+Scene_Menu.prototype.constructor = Scene_Menu;
+Scene_Menu.prototype.start = function () {};
+Scene_Menu.prototype.terminate = function () {};
+global.Scene_Menu = Scene_Menu;
+function Scene_Gameover() {}
+Scene_Gameover.prototype.start = function () {};
+global.Scene_Gameover = Scene_Gameover;
 global.Game_Interpreter = { prototype: { pluginCommand() {} } };
 global.WebAudio = {
   _context: {
     currentTime: 0,
     sampleRate: 44100,
+    createGain: () => makeNode(),
     createAnalyser: () => ({
       fftSize: 2048,
       smoothingTimeConstant: 0.8,
@@ -265,6 +280,47 @@ ok("isKnown pansweep", A.isKnownPluginCommand("pansweep-bgm1"));
   const snap = A.pausedSnapshots.get("bgm_3");
   ok("B12 paused after load", A.pausedTracks.has("bgm_3"));
   ok("B12 keeps position", snap && Math.abs(snap.pos - 42.5) < 1e-6);
+}
+
+// B17 leftover keys not in the snapshot are stopped
+{
+  pendingBuffers.push({});
+  A.playAudio({ type: "bgs", trackId: "17", name: "Rain", volume: 80, fadein: 0 });
+  ok("B17 leftover live", A.tracks.has("bgs_17"));
+  A.namedSnapshots.set("b17", new Map());
+  A.loadAllStates("b17");
+  ok("B17 leftover stopped", !A.tracks.has("bgs_17"));
+}
+
+// B19 menu-family: Item is MenuBase so menu-pause must not resume on submenu push
+{
+  pendingBuffers.push({});
+  A.playAudio({
+    type: "bgm",
+    trackId: "19",
+    name: "Town",
+    volume: 80,
+    fadein: 0,
+    pauseMode: "menu",
+  });
+  Scene_MenuBase.prototype.start.call({});
+  ok("B19 pauses on MenuBase start", A.pausedTracks.has("bgm_19"));
+  function Scene_Item() {}
+  Scene_Item.prototype = Object.create(Scene_MenuBase.prototype);
+  global.SceneManager._nextScene = Scene_Item;
+  Scene_MenuBase.prototype.terminate.call({});
+  ok("B19 stays paused into Item", A.pausedTracks.has("bgm_19"));
+  global.SceneManager._nextScene = global.Scene_Map;
+  Scene_MenuBase.prototype.terminate.call({});
+  ok("B19 resumes leaving menus", !A.pausedTracks.has("bgm_19"));
+  A.stopAudio("bgm", "19", 0);
+}
+
+// B29 dashless syncplay type all → bgm
+{
+  pendingBuffers.push({}, {});
+  A.syncPlay("all", ["Drums", "Bass"]);
+  ok("B29 stem keys are bgm", A.tracks.has("bgm_1") && A.tracks.has("bgm_2"));
 }
 
 // Acceptance: core play/stop/fade/pause/resume dispatch

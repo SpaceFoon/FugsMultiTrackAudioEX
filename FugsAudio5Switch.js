@@ -140,6 +140,243 @@
     commandBuffer: new Map(),
     activeCommands: new Map(),
     restoreCommands: new Map(),
+    // Pre-command snapshots for reversing non-play switch actions (B24).
+    _preCommandState: new Map(),
+
+    _trackKey(command) {
+      if (!command) return "";
+      const type = command.type != null ? String(command.type) : "";
+      const trackId = command.trackId != null ? String(command.trackId) : "";
+      return type && trackId ? `${type}_${trackId}` : "";
+    },
+
+    _capturePreCommandState(command) {
+      const key = this._trackKey(command);
+      const state = { trackKey: key };
+      const buffer = key && hub.tracks ? hub.tracks.get(key) : null;
+
+      if (buffer) {
+        state.volume =
+          buffer._manualVolume != null ? buffer._manualVolume : buffer.volume;
+        state.pan = buffer.pan != null ? buffer.pan : 0;
+        state.pitchBase =
+          buffer._basePitch != null
+            ? buffer._basePitch
+            : buffer.pitch != null
+              ? buffer.pitch
+              : 1;
+        state.effect = buffer._effect != null ? buffer._effect : null;
+      }
+
+      if (key && hub.proximityData && hub.proximityData.has(key)) {
+        state.hadProximity = true;
+      }
+      if (key && hub.panSweeps && hub.panSweeps.has(key)) {
+        state.hadPanSweep = true;
+      }
+
+      return state;
+    },
+
+    _restoreMixerState(command, preState) {
+      if (!preState) return false;
+      const opts = { duration: 0 };
+      if (preState.volume != null) opts.volume = preState.volume * 100;
+      if (preState.pan != null) opts.pan = preState.pan;
+      if (preState.pitchBase != null) opts.pitch = preState.pitchBase * 100;
+      try {
+        return hub.fadeAudio(command.type, command.trackId, opts);
+      } catch (error) {
+        Logger.error(`Error restoring mixer for switch command:`, error);
+        return false;
+      }
+    },
+
+    _restoreEffectState(command, preState) {
+      if (!preState) return false;
+      const key = preState.trackKey || this._trackKey(command);
+      if (!key) return false;
+      try {
+        if (preState.effect && typeof hub.applyEffect === "function") {
+          return hub.applyEffect(key, preState.effect);
+        }
+        if (typeof hub.clearEffect === "function") {
+          return hub.clearEffect(key, { keepConfig: false });
+        }
+      } catch (error) {
+        Logger.error(`Error restoring effect for switch command:`, error);
+      }
+      return false;
+    },
+
+    _reverseSpatialState(command, preState) {
+      let reversed = false;
+      const { type, trackId } = command;
+      if (preState && preState.hadProximity && typeof hub.clearProximity === "function") {
+        try {
+          hub.clearProximity(type, trackId);
+          reversed = true;
+        } catch (error) {
+          Logger.error(`Error clearing proximity for switch command:`, error);
+        }
+      }
+      if (preState && preState.hadPanSweep && typeof hub.stopPanSweep === "function") {
+        try {
+          hub.stopPanSweep(type, trackId);
+          reversed = true;
+        } catch (error) {
+          Logger.error(`Error stopping pan sweep for switch command:`, error);
+        }
+      }
+      return reversed;
+    },
+
+    _reverseSwitchCommand(command, preState) {
+      const action = command && command.action != null ? String(command.action) : "";
+
+      switch (action) {
+        case "play":
+          try {
+            hub.stopAudio(command.type, command.trackId, 0);
+            return true;
+          } catch (error) {
+            Logger.error(`Error stopping audio for switch command:`, error);
+            return false;
+          }
+
+        case "duck":
+          // Restore commands run after the active list is cleared.
+          return false;
+
+        case "fade":
+        case "pitch":
+        case "pan":
+          return this._restoreMixerState(command, preState);
+
+        case "effect":
+        case "fadeeffect":
+        case "fadeouteffect":
+        case "cleareffect":
+        case "crossfadeeffect":
+          return this._restoreEffectState(command, preState);
+
+        case "proximity":
+        case "doppler":
+          if (typeof hub.clearProximity === "function") {
+            try {
+              hub.clearProximity(command.type, command.trackId);
+              return true;
+            } catch (error) {
+              Logger.error(`Error clearing proximity for switch command:`, error);
+            }
+          }
+          return false;
+
+        case "pansweep":
+          if (typeof hub.stopPanSweep === "function") {
+            try {
+              hub.stopPanSweep(command.type, command.trackId);
+              return true;
+            } catch (error) {
+              Logger.error(`Error stopping pan sweep for switch command:`, error);
+            }
+          }
+          return false;
+
+        default: {
+          let reversed = false;
+          if (preState) {
+            if (this._restoreMixerState(command, preState)) reversed = true;
+            if (this._restoreEffectState(command, preState)) reversed = true;
+            if (this._reverseSpatialState(command, preState)) reversed = true;
+          }
+          return reversed;
+        }
+      }
+    },
+
+    _serializeMapOfArrays(map) {
+      const out = {};
+      for (const [switchId, list] of map.entries()) {
+        out[String(switchId)] = Array.isArray(list) ? list : [];
+      }
+      return out;
+    },
+
+    _deserializeMapOfArrays(obj) {
+      const map = new Map();
+      if (!obj || typeof obj !== "object") return map;
+      for (const [switchId, list] of Object.entries(obj)) {
+        map.set(Number(switchId), Array.isArray(list) ? list : []);
+      }
+      return map;
+    },
+
+    _serializePreCommandState() {
+      const out = {};
+      for (const [commandId, state] of this._preCommandState.entries()) {
+        out[String(commandId)] = state;
+      }
+      return out;
+    },
+
+    _deserializePreCommandState(obj) {
+      this._preCommandState.clear();
+      if (!obj || typeof obj !== "object") return;
+      for (const [commandId, state] of Object.entries(obj)) {
+        this._preCommandState.set(Number(commandId), state);
+      }
+    },
+
+    _captureForSave() {
+      if (
+        !this.commandBuffer.size &&
+        !this.activeCommands.size &&
+        !this.restoreCommands.size &&
+        !this._preCommandState.size &&
+        !SwitchManager.monitoredSwitches.size
+      ) {
+        return null;
+      }
+
+      return {
+        commandBuffer: this._serializeMapOfArrays(this.commandBuffer),
+        activeCommands: this._serializeMapOfArrays(this.activeCommands),
+        restoreCommands: this._serializeMapOfArrays(this.restoreCommands),
+        preCommandState: this._serializePreCommandState(),
+        monitoredSwitches: SwitchManager.getMonitoredSwitches(),
+      };
+    },
+
+    _restoreFromSave(data) {
+      this.commandBuffer.clear();
+      this.activeCommands.clear();
+      this.restoreCommands.clear();
+      this._preCommandState.clear();
+      SwitchManager.clearAll();
+
+      if (!data || typeof data !== "object") return;
+
+      this.commandBuffer = this._deserializeMapOfArrays(data.commandBuffer);
+      this.activeCommands = this._deserializeMapOfArrays(data.activeCommands);
+      this.restoreCommands = this._deserializeMapOfArrays(data.restoreCommands);
+      this._deserializePreCommandState(data.preCommandState);
+
+      const monitored = Array.isArray(data.monitoredSwitches) ? data.monitoredSwitches : [];
+      for (let i = 0; i < monitored.length; i++) {
+        SwitchManager.addSwitch(monitored[i]);
+      }
+      for (const switchId of this.commandBuffer.keys()) {
+        SwitchManager.addSwitch(switchId);
+      }
+      for (const switchId of this.restoreCommands.keys()) {
+        SwitchManager.addSwitch(switchId);
+      }
+
+      Logger.switch(
+        `Restored switch buffer (${this.commandBuffer.size} switches, ${SwitchManager.monitoredSwitches.size} monitored)`
+      );
+    },
 
     _makeCommandKey(command) {
       if (!command) return "||";
@@ -220,7 +457,10 @@
         for (let i = lastIndex - 1; i >= 0; i--) {
           if (this._makeCommandKey(list[i]) === commandKey) {
             const removed = list.splice(i, 1)[0];
-            if (removed && removed.id) this._removeActiveId(switchId, removed.id);
+            if (removed && removed.id) {
+              this._removeActiveId(switchId, removed.id);
+              this._preCommandState.delete(removed.id);
+            }
             lastIndex -= 1;
           }
         }
@@ -246,7 +486,10 @@
         command._fugsSwitchSig = signature;
         list[lastIndex] = command;
 
-        if (oldId) this._removeActiveId(switchId, oldId);
+        if (oldId) {
+          this._removeActiveId(switchId, oldId);
+          this._preCommandState.delete(oldId);
+        }
         Logger.switch(`Updated buffered command for switch ${switchId}`, {
           oldCommandId: oldId,
           commandId: newId,
@@ -369,10 +612,17 @@
             trackId: command.trackId,
           });
 
+          const action = command.action != null ? String(command.action) : "";
+          if (action !== "duck") {
+            this._preCommandState.set(command.id, this._capturePreCommandState(command));
+          }
+
           const result = hub.executeCommand(command);
           if (result) {
             activeList.push(command.id);
             executedCount++;
+          } else if (action !== "duck") {
+            this._preCommandState.delete(command.id);
           }
         } catch (error) {
           Logger.error(`Error executing switch command for switch ${switchId}:`, error);
@@ -390,27 +640,22 @@
       const commands = this.commandBuffer.get(switchId);
       const activeList = this.activeCommands.get(switchId);
 
-      // Actually stop the audio tracks that were started by switch commands
+      // Reverse every executed switch command (B24).
       if (commands && activeList && activeList.length > 0) {
-        let stoppedCount = 0;
+        let reversedCount = 0;
 
         commands.forEach((command) => {
-          // Only stop if this command was executed (its ID is in activeList)
-          if (activeList.includes(command.id)) {
-            // Only stop "play" commands, not fades/ducks/etc
-            if (command.action === "play") {
-              try {
-                hub.stopAudio(command.type, command.trackId, 0);
-                stoppedCount++;
-              } catch (error) {
-                Logger.error(`Error stopping audio for switch ${switchId}:`, error);
-              }
-            }
+          if (!activeList.includes(command.id)) return;
+
+          const preState = this._preCommandState.get(command.id);
+          if (this._reverseSwitchCommand(command, preState)) {
+            reversedCount++;
           }
+          this._preCommandState.delete(command.id);
         });
 
-        if (stoppedCount > 0) {
-          Logger.success(`Stopped ${stoppedCount} audio tracks for switch ${switchId}`);
+        if (reversedCount > 0) {
+          Logger.success(`Reversed ${reversedCount} switch commands for switch ${switchId}`);
         }
       }
 
@@ -445,9 +690,19 @@
       }
     },
 
+    _clearPreStateForSwitch(switchId) {
+      const commands = this.commandBuffer.get(switchId);
+      if (!commands) return;
+      for (let i = 0; i < commands.length; i++) {
+        const cmd = commands[i];
+        if (cmd && cmd.id) this._preCommandState.delete(cmd.id);
+      }
+    },
+
     clearSwitch(switchId) {
       const hadCommands = this.commandBuffer.has(switchId);
 
+      this._clearPreStateForSwitch(switchId);
       this.commandBuffer.delete(switchId);
       this.activeCommands.delete(switchId);
       this.restoreCommands.delete(switchId);
@@ -464,6 +719,7 @@
       this.commandBuffer.clear();
       this.activeCommands.clear();
       this.restoreCommands.clear();
+      this._preCommandState.clear();
 
       // Clear all monitored switches
       for (const switchId of SwitchManager.getMonitoredSwitches()) {
@@ -489,6 +745,18 @@
       SwitchBuffer.executeSwitch(switchId, true);
     }
     return true;
+  });
+
+  // B21: persist SwitchBuffer + monitored switches in __fugsMeta (same pattern as pump).
+  hub.onCaptureGlobalState(function () {
+    const snap = SwitchBuffer._captureForSave();
+    if (!snap) return undefined;
+    return { switchBuffer: snap };
+  });
+
+  hub.onRestoreGlobalState(function (meta) {
+    if (!meta || !meta.switchBuffer) return;
+    SwitchBuffer._restoreFromSave(meta.switchBuffer);
   });
 
   SwitchManager.init();

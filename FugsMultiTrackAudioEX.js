@@ -331,8 +331,9 @@
     _lastTick: 0, // Timestamp of last successful update()
 
     startFade(key, startValue, targetValue, duration, onUpdate, onComplete, curve = "smooth") {
+      // B35: superseding a fade must not fire the old onComplete (duck restore).
       if (this.activeFades.has(key)) {
-        this.cancelFade(key);
+        this.cancelFade(key, { complete: false });
       }
 
       // Handle instant fade (duration = 0)
@@ -459,8 +460,19 @@
           return progress; // fallback to linear
       }
     },
-    cancelFade(key) {
+    /**
+     * Cancel an in-flight fade.
+     * @param {string} key - Fade key (e.g. bgm_1_volume)
+     * @param {{ complete?: boolean }} [options] - complete:true fires onComplete before removal
+     */
+    cancelFade(key, options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const fade = this.activeFades.get(key);
+      if (!fade) return;
       this.activeFades.delete(key);
+      if (opts.complete && fade.onComplete) {
+        fade.onComplete();
+      }
       // RAF will auto-stop when activeFades is empty (see update())
     },
 
@@ -501,6 +513,7 @@
     _restoreStateHooks: [],
     _captureGlobalStateHooks: [],
     _restoreGlobalStateHooks: [],
+    _resetRuntimeHooks: [],
     _savedGlobalMeta: null, // pending __fugsMeta from applySaveData
     _switchGatedHandlers: [],
     _coreLifecycleRegistered: false,
@@ -582,7 +595,210 @@
     onRestoreState(fn) { if (typeof fn === "function") this._restoreStateHooks.push(fn); },
     onCaptureGlobalState(fn) { if (typeof fn === "function") this._captureGlobalStateHooks.push(fn); },
     onRestoreGlobalState(fn) { if (typeof fn === "function") this._restoreGlobalStateHooks.push(fn); },
+    onResetRuntime(fn) { if (typeof fn === "function") this._resetRuntimeHooks.push(fn); },
     onSwitchGatedCommand(fn) { if (typeof fn === "function") this._switchGatedHandlers.push(fn); },
+
+    _validFadeCurves() {
+      return new Set([
+        "linear",
+        "exponential",
+        "logarithmic",
+        "smooth",
+        "sharp",
+        "gentle",
+        "ease-in",
+        "ease-out",
+        "ease-in-out",
+      ]);
+    },
+
+    _detectPositionalCurve(args, defaultCurve) {
+      const allowed = this._validFadeCurves();
+      const fallback = defaultCurve != null ? defaultCurve : "smooth";
+      if (!args || args.length === 0) return { args: args || [], curve: fallback };
+      const last = args[args.length - 1];
+      if (typeof last === "string" && allowed.has(last.toLowerCase())) {
+        return { args: args.slice(0, -1), curve: last.toLowerCase() };
+      }
+      return { args, curve: fallback };
+    },
+
+    _getMixerVolume(buffer) {
+      if (!buffer) return 0;
+      if (buffer._manualVolume !== undefined && buffer._manualVolume !== null) {
+        return buffer._manualVolume;
+      }
+      if (buffer._originalVolume !== undefined && buffer._originalVolume !== null) {
+        return buffer._originalVolume;
+      }
+      return buffer.volume;
+    },
+
+    _getMixerPan(buffer) {
+      if (!buffer) return 0;
+      if (buffer._manualPan !== undefined && buffer._manualPan !== null) {
+        return buffer._manualPan;
+      }
+      return buffer.pan;
+    },
+
+    _trackTimeout(key, timeoutId, role) {
+      if (!this.activeTimeouts.has(key)) {
+        this.activeTimeouts.set(key, []);
+      }
+      const list = this.activeTimeouts.get(key);
+      if (role) {
+        list.push({ id: timeoutId, role });
+      } else {
+        list.push(timeoutId);
+      }
+    },
+
+    _timeoutEntryId(entry) {
+      return entry && typeof entry === "object" && entry.id != null ? entry.id : entry;
+    },
+
+    _removeTrackedTimeout(key, timeoutId) {
+      if (!this.activeTimeouts.has(key)) return;
+      const list = this.activeTimeouts.get(key);
+      const index = list.findIndex((entry) => this._timeoutEntryId(entry) === timeoutId);
+      if (index > -1) list.splice(index, 1);
+      if (list.length === 0) this.activeTimeouts.delete(key);
+    },
+
+    _clearAllTimeouts(key) {
+      if (!this.activeTimeouts.has(key)) return;
+      const list = this.activeTimeouts.get(key);
+      list.forEach((entry) => clearTimeout(this._timeoutEntryId(entry)));
+      this.activeTimeouts.delete(key);
+    },
+
+    _clearTimeoutsByRole(key, rolesToCancel) {
+      if (!this.activeTimeouts.has(key)) return;
+      const list = this.activeTimeouts.get(key);
+      const keep = [];
+      let cleared = 0;
+      for (const entry of list) {
+        const role = entry && typeof entry === "object" ? entry.role : null;
+        if (role && rolesToCancel.includes(role)) {
+          clearTimeout(this._timeoutEntryId(entry));
+          cleared++;
+        } else {
+          keep.push(entry);
+        }
+      }
+      if (keep.length) this.activeTimeouts.set(key, keep);
+      else this.activeTimeouts.delete(key);
+      if (cleared) {
+        Logger.info(`Cancelled ${cleared} timeout(s) [${rolesToCancel.join(", ")}] for ${key}`);
+      }
+    },
+
+    _isMenuFamilyScene(scene) {
+      if (!scene) return false;
+      const MenuBase = typeof Scene_MenuBase !== "undefined" ? Scene_MenuBase : null;
+      if (typeof MenuBase !== "function") return false;
+      try {
+        // SceneManager._nextScene is a constructor, not an instance.
+        if (typeof scene === "function") {
+          return scene === MenuBase || (scene.prototype && scene.prototype instanceof MenuBase);
+        }
+        return scene instanceof MenuBase;
+      } catch (_e) {
+        return false;
+      }
+    },
+
+    _pauseMenuModeTracks() {
+      for (const [key, buffer] of this.tracks.entries()) {
+        if (buffer._pauseMode === "menu" && !this.pausedTracks.has(key)) {
+          const [type, trackId] = key.split("_");
+          this.pauseAudio(type, trackId, []);
+        }
+      }
+    },
+
+    _resumeMenuModeTracks() {
+      const menuPausedTracks = Array.from(this.pausedTracks).filter((key) => {
+        const buffer = this.tracks.get(key);
+        return buffer && buffer._pauseMode === "menu";
+      });
+      menuPausedTracks.forEach((key) => {
+        const [type, trackId] = key.split("_");
+        this.resumeAudio(type, trackId, []);
+        Logger.info(`Resumed ${key} after menu exit`);
+      });
+    },
+
+    _resumeSceneModeTracks() {
+      const scenePausedTracks = Array.from(this.pausedTracks).filter((key) => {
+        const buffer = this.tracks.get(key);
+        const snap = this.pausedSnapshots.get(key);
+        return buffer && buffer._pauseMode === "scene" && snap && snap._autoScenePause;
+      });
+      scenePausedTracks.forEach((key) => {
+        const [type, trackId] = key.split("_");
+        this.resumeAudio(type, trackId, []);
+        Logger.info(`Resumed ${key} after scene transition`);
+      });
+    },
+
+    /**
+     * Reset mixer + satellite runtime (B25). Satellites may register onResetRuntime hooks.
+     * @param {{ stop?: boolean }} [options] - stop:true (default) calls stopAll(0) first
+     */
+    resetRuntime(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const doStop = opts.stop !== false;
+
+      if (doStop) {
+        this.stopAll(0);
+      }
+
+      FadeManager.cancelAllFades();
+      this.namedSnapshots.clear();
+      this.pausedTracks.clear();
+      this.pausedSnapshots.clear();
+      this._savedGlobalMeta = null;
+      this.proximityErrors.clear();
+      this.lastPlayerX = null;
+      this.lastPlayerY = null;
+
+      if (this.SwitchBuffer && typeof this.SwitchBuffer.clearAll === "function") {
+        this.SwitchBuffer.clearAll();
+      }
+      if (this.sfxAliases && typeof this.sfxAliases.clear === "function") {
+        this.sfxAliases.clear();
+      }
+      if (this.aliasLastPlayed && typeof this.aliasLastPlayed.clear === "function") {
+        this.aliasLastPlayed.clear();
+      }
+      if (this.proximityData && typeof this.proximityData.clear === "function") {
+        this.proximityData.clear();
+      }
+      if (this.panSweeps && typeof this.panSweeps.clear === "function") {
+        this.panSweeps.clear();
+      }
+      if (this.sidechainConnections) {
+        for (const [connKey, conn] of this.sidechainConnections.entries()) {
+          this._disposeSidechainConnection(connKey, conn, { restoreTarget: true });
+        }
+        this.sidechainConnections.clear();
+      }
+
+      this.pumpConfig = {
+        active: false,
+        bpm: 120,
+        depth: 0,
+        shape: "sine",
+        tracks: "all",
+        startTime: 0,
+      };
+      if (typeof this._stopPumpRaf === "function") this._stopPumpRaf();
+
+      this._runHooks(this._resetRuntimeHooks);
+      Logger.success("Fugs audio runtime reset");
+    },
 
     _runHooks(list, ...args) {
       if (!list || !list.length) return;
@@ -830,14 +1046,22 @@
         case "stop":
           return this.stopAudio(type, trackId, this.toNum(args[0], 0));
 
-        case "fade":
+        case "fade": {
+          let fadeArgs = args.slice();
+          let fadeCurve = parsedCurve;
+          if (!fadeCurve) {
+            const detected = this._detectPositionalCurve(fadeArgs);
+            fadeArgs = detected.args;
+            fadeCurve = detected.curve;
+          }
           return this.fadeAudio(type, trackId, {
-            volume: args[0] !== undefined ? this.toNum(args[0]) : undefined,
-            duration: this.toNum(args[1], 0),
-            pan: args[2] !== undefined ? this.toNum(args[2]) : undefined,
-            pitch: args[3] !== undefined ? this.toNum(args[3]) : undefined,
-            curve: parsedCurve || args[4] || "smooth",
+            volume: fadeArgs[0] !== undefined ? this.toNum(fadeArgs[0]) : undefined,
+            duration: this.toNum(fadeArgs[1], 0),
+            pan: fadeArgs[2] !== undefined ? this.toNum(fadeArgs[2]) : undefined,
+            pitch: fadeArgs[3] !== undefined ? this.toNum(fadeArgs[3]) : undefined,
+            curve: fadeCurve || "smooth",
           });
+        }
 
         case "duck":
           return this.duckVolume(
@@ -1025,7 +1249,7 @@
           return this.listall("all");
 
         case "fadeall":
-          return this.fadeAllAudio(args);
+          return this.fadeAllAudio(args, commandObject.curve);
 
         case "duckall":
           return this.duckAllAudio(args, switchId);
@@ -1061,7 +1285,7 @@
         case "fadeall-me":
         case "fadeall-se": {
           const fadeallType = action.split("-")[1]; // Extract bgm/bgs/me/se
-          return this.fadeAllOfType(fadeallType, args);
+          return this.fadeAllOfType(fadeallType, args, commandObject.curve);
         }
 
         case "duckall-bgm":
@@ -1141,7 +1365,10 @@
           // syncplay TrackName1 TrackName2 ... [vol1 vol2 ...] or
           // syncplay-bgm TrackName1 TrackName2 ... [vol1 vol2 ...]
           // Volumes are optional, default to 90 for first track, 0 for rest
-          return this.syncPlay(type, args);
+          return this.syncPlay(type, args, {
+            persistence: commandObject.persistence,
+            pauseMode: commandObject.pauseMode,
+          });
 
         case "sidechain":
           // sidechain <sourceId> <targetId> [threshold] [ratio] [attack] [release]
@@ -1151,21 +1378,35 @@
           // stopsidechain <sourceId> <targetId>
           return this.stopSidechain(args);
 
-        case "pitch":
-          // pitch-bgm1 120 [duration] [curve] — shorthand for pitch-only fade
+        case "pitch": {
+          let pitchArgs = args.slice();
+          let pitchCurve = parsedCurve;
+          if (!pitchCurve) {
+            const detected = this._detectPositionalCurve(pitchArgs);
+            pitchArgs = detected.args;
+            pitchCurve = detected.curve;
+          }
           return this.fadeAudio(type, trackId, {
-            pitch: args[0] !== undefined ? this.toNum(args[0]) : undefined,
-            duration: this.toNum(args[1], 0),
-            curve: parsedCurve || args[2] || "smooth",
+            pitch: pitchArgs[0] !== undefined ? this.toNum(pitchArgs[0]) : undefined,
+            duration: this.toNum(pitchArgs[1], 0),
+            curve: pitchCurve || "smooth",
           });
+        }
 
-        case "pan":
-          // pan-bgm1 -50 [duration] [curve] — shorthand for pan-only fade
+        case "pan": {
+          let panArgs = args.slice();
+          let panCurve = parsedCurve;
+          if (!panCurve) {
+            const detected = this._detectPositionalCurve(panArgs);
+            panArgs = detected.args;
+            panCurve = detected.curve;
+          }
           return this.fadeAudio(type, trackId, {
-            pan: args[0] !== undefined ? this.toNum(args[0]) : undefined,
-            duration: this.toNum(args[1], 0),
-            curve: parsedCurve || args[2] || "smooth",
+            pan: panArgs[0] !== undefined ? this.toNum(panArgs[0]) : undefined,
+            duration: this.toNum(panArgs[1], 0),
+            curve: panCurve || "smooth",
           });
+        }
 
         case "doppler":
           // doppler-bgm1 {event:5, maxDistance:10} — proximity with doppler forced on
@@ -1193,21 +1434,6 @@
     _scheduleTrackEndAction(key, buffer, offsetSeconds = 0) {
       if (!buffer || !key) return;
 
-      const trackTimeout = (timeoutId) => {
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
-      };
-
-      const removeTrackedTimeout = (timeoutId) => {
-        if (!this.activeTimeouts.has(key)) return;
-        const list = this.activeTimeouts.get(key);
-        const index = list.indexOf(timeoutId);
-        if (index > -1) list.splice(index, 1);
-        if (list.length === 0) this.activeTimeouts.delete(key);
-      };
-
       const schedule = () => {
         if (this.tracks.get(key) !== buffer) return;
         if (buffer._fugsManualStop) return;
@@ -1217,15 +1443,25 @@
           typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
 
         if (totalTime <= 0) {
+          buffer._fugsEndActionRetries = (buffer._fugsEndActionRetries || 0) + 1;
+          if (buffer._fugsEndActionRetries > 50) {
+            Logger.warn(
+              `End timer gave up for ${key} after 50 retries (_totalTime=${totalTime}) — cleaning up`
+            );
+            this.cleanupTrack(key);
+            this.tracks.delete(key);
+            return;
+          }
           const retryId = setTimeout(schedule, 200);
-          trackTimeout(retryId);
+          this._trackTimeout(key, retryId, "endAction");
           return;
         }
 
+        buffer._fugsEndActionRetries = 0;
         const remaining = Math.max(0, totalTime - (offsetSeconds || 0));
         const delayMs = Math.max(50, (remaining / pitchNow) * 1000 + 60);
         const timeoutId = setTimeout(() => {
-          removeTrackedTimeout(timeoutId);
+          this._removeTrackedTimeout(key, timeoutId);
           if (this.tracks.get(key) !== buffer) return;
           if (buffer._fugsManualStop) return;
 
@@ -1247,7 +1483,7 @@
           this.tracks.delete(key);
           this.cleanupTrack(key);
         }, delayMs);
-        trackTimeout(timeoutId);
+        this._trackTimeout(key, timeoutId, "endAction");
       };
 
       if (
@@ -1349,6 +1585,7 @@
 
         // Manual volume tracking for proximity audio compatibility
         buffer._manualVolume = volume / 100; // Track user-set volume separately
+        buffer._manualPan = Math.max(-1, Math.min(1, pan / 100));
 
         // Pitch System Initialization
         buffer._basePitch = Math.max(0.1, Math.min(4, pitch / 100));
@@ -1443,7 +1680,15 @@
      * @param {string} type - Audio type (bgm, bgs, etc.)
      * @param {array} args - [name1, name2, ..., vol1, vol2, ...] or just [name1, name2, ...]
      */
-    syncPlay(type, args) {
+    syncPlay(type, args, options) {
+      const opts = options && typeof options === "object" ? options : {};
+      // B29: dashless syncplay parses as type "all" — default to bgm for stem mixing
+      if (type === "all") type = "bgm";
+
+      const stemPersistence =
+        opts.persistence != null ? opts.persistence : DefaultPersistenceMode;
+      const stemPauseMode = opts.pauseMode != null ? opts.pauseMode : DefaultPauseMode;
+
       if (!args || args.length === 0) {
         Logger.error("syncPlay requires at least one track name");
         return false;
@@ -1505,8 +1750,8 @@
           }
 
           buffer._name = name;
-          buffer._persistence = DefaultPersistenceMode;
-          buffer._pauseMode = DefaultPauseMode;
+          buffer._persistence = stemPersistence;
+          buffer._pauseMode = stemPauseMode;
           buffer._originalVolume = volumes[i] / 100;
           buffer._syncGroup = `sync_${Date.now()}`; // Tag for sync group identification
 
@@ -1560,7 +1805,7 @@
         return false;
       }
 
-      // Schedule start slightly in the future to ensure all are ready
+      // B28: schedule start slightly in the future, then re-start sources at that time
       const startTime = WebAudio._context.currentTime + 0.05; // 50ms buffer
 
       Logger.info(
@@ -1571,6 +1816,8 @@
         // Set initial volume
         buffer.volume = Math.max(0, Math.min(1, volume / 100));
         buffer.pan = 0;
+        buffer._manualVolume = volume / 100;
+        buffer._manualPan = 0;
 
         // Pitch initialization
         buffer._basePitch = 1.0;
@@ -1580,16 +1827,22 @@
         // Store in tracks map
         this.tracks.set(key, buffer);
 
-        // Start with loop enabled, at the scheduled time
-        // We need to access the internal WebAudio source node
         try {
-          // First call play() to create the source node infrastructure
           buffer.play(true, 0);
 
-          // The buffer is now playing from "now", but we want precise sync
-          // For truly sample-accurate sync, we'd need to access _sourceNode.start(when)
-          // RPG Maker's buffer.play() doesn't expose this, so this is "close enough"
-          // The 50ms scheduling window helps, but it's not perfect
+          // B28: if source node exists, stop the immediate start and re-schedule at startTime
+          if (buffer._sourceNode && typeof buffer._sourceNode.start === "function") {
+            try {
+              buffer._sourceNode.stop();
+            } catch (_stopErr) {
+              /* may not have started yet */
+            }
+            try {
+              buffer._sourceNode.start(startTime);
+            } catch (startErr) {
+              Logger.warn(`syncPlay: Could not schedule ${key} at ${startTime}: ${startErr.message}`);
+            }
+          }
 
           Logger.success(`syncPlay: Started ${key} (${buffer._name}) at ${volume}% volume`);
         } catch (error) {
@@ -1639,11 +1892,7 @@
       }
 
       // Cancel any pending timeouts for this track immediately (e.g. finite-loop end timers)
-      if (this.activeTimeouts.has(key)) {
-        const timeoutIds = this.activeTimeouts.get(key);
-        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
-        this.activeTimeouts.delete(key);
-      }
+      this._clearAllTimeouts(key);
 
       if (fadeout > 0) {
         Logger.info(`Stopping ${key} with ${fadeout}s fadeout`);
@@ -1682,19 +1931,11 @@
           }
 
           // Remove timeout from tracking
-          if (this.activeTimeouts.has(key)) {
-            const timeouts = this.activeTimeouts.get(key);
-            const index = timeouts.indexOf(timeoutId);
-            if (index > -1) timeouts.splice(index, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(key);
-          }
+          this._removeTrackedTimeout(key, timeoutId);
         }, fadeout * 1000);
 
         // Track this timeout for cleanup
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
+        this._trackTimeout(key, timeoutId, "crossfadeStop");
       } else {
         // Disconnect pump gain node before stopping
         if (buffer._pumpGainNode) {
@@ -1794,6 +2035,7 @@
             const buf = this.tracks.get(key);
             if (!buf) return; // Track was stopped/replaced
             buf.pan = Math.max(-1, Math.min(1, value));
+            buf._manualPan = buf.pan;
           },
           checkComplete,
           curve
@@ -1835,11 +2077,12 @@
     },
 
     // Global fade functions
-    fadeAllAudio(args) {
+    fadeAllAudio(args, curve) {
       const volume = this.toNum(args[0]);
       const duration = this.toNum(args[1], 0);
       const pan = args[2] !== undefined ? this.toNum(args[2]) : undefined;
       const pitch = args[3] !== undefined ? this.toNum(args[3]) : undefined;
+      const fadeCurve = curve || "smooth";
 
       let count = 0;
       let completed = 0;
@@ -1852,7 +2095,7 @@
 
         const [type, trackId] = key.split("_");
         if (
-          this.fadeAudio(type, trackId, { volume, duration, pan, pitch }, () => {
+          this.fadeAudio(type, trackId, { volume, duration, pan, pitch, curve: fadeCurve }, () => {
             completed++;
             if (completed === count) {
               Logger.success(`Global fade complete: ${count} tracks faded`);
@@ -1867,11 +2110,12 @@
       return count;
     },
 
-    fadeAllOfType(type, args) {
+    fadeAllOfType(type, args, curve) {
       const volume = args[0] !== undefined ? this.toNum(args[0]) : undefined;
       const duration = this.toNum(args[1], 0);
       const pan = args[2] !== undefined ? this.toNum(args[2]) : undefined;
       const pitch = args[3] !== undefined ? this.toNum(args[3]) : undefined;
+      const fadeCurve = curve || "smooth";
       let count = 0;
       let completed = 0;
 
@@ -1886,7 +2130,7 @@
 
           const trackId = key.split("_")[1];
           if (
-            this.fadeAudio(type, trackId, { volume, duration, pan, pitch }, () => {
+            this.fadeAudio(type, trackId, { volume, duration, pan, pitch, curve: fadeCurve }, () => {
               completed++;
               if (completed === count) {
                 Logger.success(`${type.toUpperCase()} fade complete: ${count} tracks faded`);
@@ -1970,8 +2214,8 @@
       const pausedSnapshot = {
         name: buffer._name,
         pos: currentTime,
-        volume: buffer.volume,
-        pan: buffer.pan,
+        volume: this._getMixerVolume(buffer),
+        pan: this._getMixerPan(buffer),
         pitch: buffer._basePitch || buffer.pitch,
         persistence: buffer._persistence,
         pauseMode: buffer._pauseMode,
@@ -1985,8 +2229,8 @@
 
       // Also save on buffer for backward compatibility
       buffer._pausedPos = currentTime; // Position in seconds
-      buffer._pausedVolume = buffer.volume;
-      buffer._pausedPan = buffer.pan;
+      buffer._pausedVolume = this._getMixerVolume(buffer);
+      buffer._pausedPan = this._getMixerPan(buffer);
       buffer._pausedPitch = buffer.pitch;
 
       Logger.info(`Pausing ${key} at position: ${currentTime}s`);
@@ -2001,13 +2245,8 @@
         this.stopPanSweep(type, trackId);
       }
 
-      // Cancel pending timeouts for this track (end timers, prior pause fades)
-      if (this.activeTimeouts.has(key)) {
-        const timeoutIds = this.activeTimeouts.get(key);
-        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
-        this.activeTimeouts.delete(key);
-        Logger.info(`Cancelled ${timeoutIds.length} pending timeout(s) for paused ${key}`);
-      }
+      // B38: pause only cancels timeouts that must die with pause (not chain/duckRestore/crossfade)
+      this._clearTimeoutsByRole(key, ["pauseStop", "endAction"]);
 
       // B16: mark paused immediately so resume works during fadeout
       this.pausedTracks.add(key);
@@ -2041,19 +2280,11 @@
           }
 
           // Remove timeout from tracking
-          if (this.activeTimeouts.has(key)) {
-            const timeouts = this.activeTimeouts.get(key);
-            const index = timeouts.indexOf(timeoutId);
-            if (index > -1) timeouts.splice(index, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(key);
-          }
+          this._removeTrackedTimeout(key, timeoutId);
         }, pauseDelay * 1000);
 
         // Track this timeout for cleanup / resume cancel
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
+        this._trackTimeout(key, timeoutId, "pauseStop");
       } else {
         try {
           buffer.stop();
@@ -2074,12 +2305,7 @@
       }
 
       // B16: cancel pending pause-stop timeout and in-progress pause fades
-      if (this.activeTimeouts.has(key)) {
-        const timeoutIds = this.activeTimeouts.get(key);
-        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
-        this.activeTimeouts.delete(key);
-        Logger.info(`Cancelled ${timeoutIds.length} pending timeout(s) for resume ${key}`);
-      }
+      this._clearTimeoutsByRole(key, ["pauseStop"]);
       FadeManager.cancelFade(`${key}_volume`);
       FadeManager.cancelFade(`${key}_pan`);
       FadeManager.cancelFade(`${key}_pitch`);
@@ -2468,12 +2694,7 @@
       }
 
       // Cancel any pending timeouts for this track
-      if (this.activeTimeouts.has(key)) {
-        const timeoutIds = this.activeTimeouts.get(key);
-        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
-        this.activeTimeouts.delete(key);
-        Logger.info(`Cancelled ${timeoutIds.length} pending timeout(s) for ${key}`);
-      }
+      this._clearAllTimeouts(key);
 
       // Disconnect and cleanup effect chains (reuse _disposeEffectChain for proper
       // node nullification, buffer clearing, and reference cleanup on older Chromium)
@@ -2594,16 +2815,16 @@
           ? pausedSnapshot.volume
           : buffer._pausedVolume != null
             ? buffer._pausedVolume
-            : buffer.volume
-        : buffer.volume;
+            : this._getMixerVolume(buffer)
+        : this._getMixerVolume(buffer);
 
       const pan = isPaused
         ? pausedSnapshot && pausedSnapshot.pan != null
           ? pausedSnapshot.pan
           : buffer._pausedPan != null
             ? buffer._pausedPan
-            : buffer.pan
-        : buffer.pan;
+            : this._getMixerPan(buffer)
+        : this._getMixerPan(buffer);
 
       const pitch = isPaused
         ? pausedSnapshot && pausedSnapshot.pitch != null
@@ -2703,11 +2924,15 @@
       if (this.playAudio(options)) {
         // If the track was paused when saved, re-pause after restoring.
         if (state.isPaused) {
-          this._restorePausedTrack(key, type, trackId, state);
+          this._restorePausedTrack(key, type, trackId, state, () => {
+            // B45: run restore hooks after pause snapshot is stored (not before deferred pause)
+            this._runRestoreHooks(key, state.ext);
+          });
+        } else {
+          // B06: let satellites (proximity/spatial) re-bind their saved state now
+          // that the track exists again.
+          this._runRestoreHooks(key, state.ext);
         }
-        // B06: let satellites (proximity/spatial) re-bind their saved state now
-        // that the track exists again.
-        this._runRestoreHooks(key, state.ext);
         Logger.info(`Restored state for ${key}${state.isPaused ? " (paused)" : ""}`);
         return true;
       }
@@ -2720,7 +2945,7 @@
     // both lose the saved position and briefly play audio. Wait for the buffer to
     // be ready before stopping, then overwrite the paused snapshot's position with
     // the authoritative saved value.
-    _restorePausedTrack(key, type, trackId, state) {
+    _restorePausedTrack(key, type, trackId, state, onComplete) {
       const buffer = this.tracks.get(key);
       const savedPos = this.toNum(state.currentTime, 0);
 
@@ -2731,8 +2956,19 @@
 
         // Force the authoritative saved position (seek() on a cold buffer is 0).
         const snap = this.pausedSnapshots.get(key);
-        if (snap) snap.pos = savedPos;
-        if (buffer) buffer._pausedPos = savedPos;
+        if (snap) {
+          snap.pos = savedPos;
+          // B34/B45: keep saved mixer volume/pan in the pause snapshot
+          if (state.volume != null) snap.volume = state.volume;
+          if (state.pan != null) snap.pan = state.pan;
+        }
+        if (buffer) {
+          buffer._pausedPos = savedPos;
+          if (state.volume != null) buffer._pausedVolume = state.volume;
+          if (state.pan != null) buffer._pausedPan = state.pan;
+        }
+
+        if (typeof onComplete === "function") onComplete();
       };
 
       const supportsReady = buffer && typeof buffer.isReady === "function";
@@ -2753,6 +2989,17 @@
       if (!snapshot) {
         Logger.warn(`No saved snapshot found: ${stateName}`);
         return false;
+      }
+
+      // B17: stop live tracks absent from the snapshot before restore
+      const snapshotKeys = new Set(snapshot.keys());
+      for (const key of Array.from(this.tracks.keys())) {
+        if (!snapshotKeys.has(key)) {
+          const parts = key.split("_");
+          if (parts.length >= 2) {
+            this.stopAudio(parts[0], parts[1], 0);
+          }
+        }
       }
 
       let count = 0;
@@ -3016,7 +3263,7 @@
         (val) => allowed.has(val)
       );
 
-      return { args: parsed.args, curve: parsed.value != null ? parsed.value : "smooth" };
+      return { args: parsed.args, curve: parsed.value };
     },
     checkPersistence(args) {
       const allowed = new Set(["always", "battle", "scene", "none"]);
@@ -3114,6 +3361,11 @@
         if (shouldPause) {
           const [type, trackId] = key.split("_");
           this.pauseAudio(type, trackId, [fadeoutDuration]);
+          // B18: mark scene auto-pauses so map start can resume without waking saved-as-paused tracks
+          if (pauseMode === "scene" && transitionType === "scene") {
+            const snap = this.pausedSnapshots.get(key);
+            if (snap) snap._autoScenePause = true;
+          }
         } else if (shouldStop) {
           const [type, trackId] = key.split("_");
 
@@ -3282,19 +3534,11 @@
           }
 
           // Remove timeout from tracking
-          if (this.activeTimeouts.has(fromKey)) {
-            const timeouts = this.activeTimeouts.get(fromKey);
-            const index = timeouts.indexOf(timeoutId);
-            if (index > -1) timeouts.splice(index, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(fromKey);
-          }
+          this._removeTrackedTimeout(fromKey, timeoutId);
         }, duration * 1000);
 
         // Track this timeout for cleanup
-        if (!this.activeTimeouts.has(fromKey)) {
-          this.activeTimeouts.set(fromKey, []);
-        }
-        this.activeTimeouts.get(fromKey).push(timeoutId);
+        this._trackTimeout(fromKey, timeoutId, "crossfadeStop");
       }
 
       // Fade in new track - wait for buffer to be ready first
@@ -3379,19 +3623,11 @@
           this.executeCommand(commandObj);
 
           // Remove timeout from tracking
-          if (this.activeTimeouts.has(key)) {
-            const timeouts = this.activeTimeouts.get(key);
-            const idx = timeouts.indexOf(timeoutId);
-            if (idx > -1) timeouts.splice(idx, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(key);
-          }
+          this._removeTrackedTimeout(key, timeoutId);
         }, currentDelay);
 
         // Track this timeout for cleanup
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
+        this._trackTimeout(key, timeoutId, "chain");
       });
 
       return true;
@@ -3882,7 +4118,7 @@
     const _Scene_Title_start = Scene_Title.prototype.start;
     Scene_Title.prototype.start = function () {
       _Scene_Title_start.call(this);
-      FugsMultiTrackAudioEX.stopAll(SceneFadeoutTime);
+      FugsMultiTrackAudioEX.resetRuntime({ stop: true });
     };
 
     const _DataManager_loadGame = DataManager.loadGame;
@@ -3901,7 +4137,14 @@
     const _DataManager_setupNewGame = DataManager.setupNewGame;
     DataManager.setupNewGame = function () {
       _DataManager_setupNewGame.call(this);
-      FugsMultiTrackAudioEX.handleSceneTransition("scene", SceneFadeoutTime);
+      FugsMultiTrackAudioEX.resetRuntime({ stop: true });
+    };
+
+    const _Scene_Map_start = Scene_Map.prototype.start;
+    Scene_Map.prototype.start = function () {
+      _Scene_Map_start.call(this);
+      // B18: resume tracks auto-paused for scene transitions (map transfer, battle return)
+      FugsMultiTrackAudioEX._resumeSceneModeTracks();
     };
 
     const _Scene_Map_create = Scene_Map.prototype.create;
@@ -3955,36 +4198,31 @@
       }
     };
 
-    const _Scene_Menu_start = Scene_Menu.prototype.start;
-    Scene_Menu.prototype.start = function () {
-      _Scene_Menu_start.call(this);
-      for (const [key, buffer] of FugsMultiTrackAudioEX.tracks.entries()) {
-        if (buffer._pauseMode === "menu" && !FugsMultiTrackAudioEX.pausedTracks.has(key)) {
-          const [type, trackId] = key.split("_");
-          FugsMultiTrackAudioEX.pauseAudio(type, trackId, []);
+    if (typeof Scene_MenuBase !== "undefined" && Scene_MenuBase.prototype) {
+      const _Scene_MenuBase_start = Scene_MenuBase.prototype.start;
+      Scene_MenuBase.prototype.start = function () {
+        if (typeof _Scene_MenuBase_start === "function") _Scene_MenuBase_start.call(this);
+        // B19: pause menu-mode tracks for any menu-family scene (Item, Shop, Name, etc.)
+        FugsMultiTrackAudioEX._pauseMenuModeTracks();
+      };
+
+      const _Scene_MenuBase_terminate = Scene_MenuBase.prototype.terminate;
+      Scene_MenuBase.prototype.terminate = function () {
+        if (typeof _Scene_MenuBase_terminate === "function") _Scene_MenuBase_terminate.call(this);
+        if (!FugsMultiTrackAudioEX._isMenuFamilyScene(SceneManager._nextScene)) {
+          FugsMultiTrackAudioEX._resumeMenuModeTracks();
         }
-      }
-    };
+      };
+    }
 
-    const _Scene_Menu_terminate = Scene_Menu.prototype.terminate;
-    Scene_Menu.prototype.terminate = function () {
-      _Scene_Menu_terminate.call(this);
-      // Collect keys FIRST into array to avoid iterator invalidation
-      // (resumeAudio modifies pausedTracks Set during iteration)
-      const menuPausedTracks = Array.from(FugsMultiTrackAudioEX.pausedTracks).filter((key) => {
-        const buffer = FugsMultiTrackAudioEX.tracks.get(key);
-        return buffer && buffer._pauseMode === "menu";
-      });
-
-      menuPausedTracks.forEach((key) => {
-        const [type, trackId] = key.split("_");
-        FugsMultiTrackAudioEX.resumeAudio(type, trackId, []);
-        Logger.info(`Resumed ${key} after menu exit`);
-      });
-    };
-
-    // Note: Proximity audio update is handled in Scene_Map.prototype.update
-    // to avoid duplicate calls per frame
+    if (typeof Scene_Gameover !== "undefined" && Scene_Gameover.prototype) {
+      const _Scene_Gameover_start = Scene_Gameover.prototype.start;
+      Scene_Gameover.prototype.start = function () {
+        if (typeof _Scene_Gameover_start === "function") _Scene_Gameover_start.call(this);
+        // B20: stop all Fugs tracks on game over
+        FugsMultiTrackAudioEX.stopAll(0);
+      };
+    }
 
     // DataManager hooks for save/load integration
     const _DataManager_makeSaveContents = DataManager.makeSaveContents;

@@ -42,6 +42,7 @@ for (const file of plugins) {
 }
 
 run("modular smoke", [path.join("scripts", "smoke.js")]);
+run("BUGS.md claim lock", [path.join("scripts", "assert-bugs.js")]);
 run("bundle build + smoke", [path.join("scripts", "smoke-bundle.js")]);
 
 console.log("\n==============================");

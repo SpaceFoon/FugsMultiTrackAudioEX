@@ -82,9 +82,9 @@
         return false;
       }
 
-      // Cooldown check
-      if (config.cooldown > 0) {
-        const lastPlayed = this.aliasLastPlayed.get(aliasName) || 0;
+      // Cooldown check — missing entry means never played (B43)
+      if (config.cooldown > 0 && this.aliasLastPlayed.has(aliasName)) {
+        const lastPlayed = this.aliasLastPlayed.get(aliasName);
         const now = performance.now();
         if (now - lastPlayed < config.cooldown) {
           Logger.info(
@@ -92,7 +92,6 @@
           );
           return false;
         }
-        this.aliasLastPlayed.set(aliasName, now);
       }
 
       // Pick random sound from pool
@@ -119,7 +118,7 @@
         pan: Math.round(finalPan),
       });
 
-      return this.playAudio({
+      const played = this.playAudio({
         type,
         trackId,
         name: soundName,
@@ -130,6 +129,13 @@
         persistence: "none",
         pauseMode: "never",
       });
+
+      // Consume cooldown only after a successful play (B41)
+      if (config.cooldown > 0 && played) {
+        this.aliasLastPlayed.set(aliasName, performance.now());
+      }
+
+      return played;
     };
 
   hub.listAliases = function() {
@@ -218,6 +224,27 @@
 
   hub.registerHandler("listaliases", function () {
     return this.listAliases();
+  });
+
+  // Persist alias configs (not cooldowns) across save/load via __fugsMeta (B22).
+  hub.onCaptureGlobalState(function () {
+    if (!this.sfxAliases || this.sfxAliases.size === 0) return undefined;
+    return { sfxAliases: Object.fromEntries(this.sfxAliases) };
+  });
+
+  hub.onRestoreGlobalState(function (meta) {
+    if (!meta || !meta.sfxAliases || typeof meta.sfxAliases !== "object") return;
+    if (!this.sfxAliases) this.sfxAliases = new Map();
+    this.sfxAliases.clear();
+    if (this.aliasLastPlayed) this.aliasLastPlayed.clear();
+    for (const [name, config] of Object.entries(meta.sfxAliases)) {
+      if (config && Array.isArray(config.pool) && config.pool.length > 0) {
+        this.sfxAliases.set(name, config);
+      }
+    }
+    if (this.sfxAliases.size > 0) {
+      Logger.info(`Restored ${this.sfxAliases.size} SFX alias(es) from save`);
+    }
   });
 
   Logger.success(TAG + " loaded — SFX aliases ready");

@@ -333,8 +333,9 @@
     _lastTick: 0, // Timestamp of last successful update()
 
     startFade(key, startValue, targetValue, duration, onUpdate, onComplete, curve = "smooth") {
+      // B35: superseding a fade must not fire the old onComplete (duck restore).
       if (this.activeFades.has(key)) {
-        this.cancelFade(key);
+        this.cancelFade(key, { complete: false });
       }
 
       // Handle instant fade (duration = 0)
@@ -461,8 +462,19 @@
           return progress; // fallback to linear
       }
     },
-    cancelFade(key) {
+    /**
+     * Cancel an in-flight fade.
+     * @param {string} key - Fade key (e.g. bgm_1_volume)
+     * @param {{ complete?: boolean }} [options] - complete:true fires onComplete before removal
+     */
+    cancelFade(key, options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const fade = this.activeFades.get(key);
+      if (!fade) return;
       this.activeFades.delete(key);
+      if (opts.complete && fade.onComplete) {
+        fade.onComplete();
+      }
       // RAF will auto-stop when activeFades is empty (see update())
     },
 
@@ -503,6 +515,7 @@
     _restoreStateHooks: [],
     _captureGlobalStateHooks: [],
     _restoreGlobalStateHooks: [],
+    _resetRuntimeHooks: [],
     _savedGlobalMeta: null, // pending __fugsMeta from applySaveData
     _switchGatedHandlers: [],
     _coreLifecycleRegistered: false,
@@ -584,7 +597,210 @@
     onRestoreState(fn) { if (typeof fn === "function") this._restoreStateHooks.push(fn); },
     onCaptureGlobalState(fn) { if (typeof fn === "function") this._captureGlobalStateHooks.push(fn); },
     onRestoreGlobalState(fn) { if (typeof fn === "function") this._restoreGlobalStateHooks.push(fn); },
+    onResetRuntime(fn) { if (typeof fn === "function") this._resetRuntimeHooks.push(fn); },
     onSwitchGatedCommand(fn) { if (typeof fn === "function") this._switchGatedHandlers.push(fn); },
+
+    _validFadeCurves() {
+      return new Set([
+        "linear",
+        "exponential",
+        "logarithmic",
+        "smooth",
+        "sharp",
+        "gentle",
+        "ease-in",
+        "ease-out",
+        "ease-in-out",
+      ]);
+    },
+
+    _detectPositionalCurve(args, defaultCurve) {
+      const allowed = this._validFadeCurves();
+      const fallback = defaultCurve != null ? defaultCurve : "smooth";
+      if (!args || args.length === 0) return { args: args || [], curve: fallback };
+      const last = args[args.length - 1];
+      if (typeof last === "string" && allowed.has(last.toLowerCase())) {
+        return { args: args.slice(0, -1), curve: last.toLowerCase() };
+      }
+      return { args, curve: fallback };
+    },
+
+    _getMixerVolume(buffer) {
+      if (!buffer) return 0;
+      if (buffer._manualVolume !== undefined && buffer._manualVolume !== null) {
+        return buffer._manualVolume;
+      }
+      if (buffer._originalVolume !== undefined && buffer._originalVolume !== null) {
+        return buffer._originalVolume;
+      }
+      return buffer.volume;
+    },
+
+    _getMixerPan(buffer) {
+      if (!buffer) return 0;
+      if (buffer._manualPan !== undefined && buffer._manualPan !== null) {
+        return buffer._manualPan;
+      }
+      return buffer.pan;
+    },
+
+    _trackTimeout(key, timeoutId, role) {
+      if (!this.activeTimeouts.has(key)) {
+        this.activeTimeouts.set(key, []);
+      }
+      const list = this.activeTimeouts.get(key);
+      if (role) {
+        list.push({ id: timeoutId, role });
+      } else {
+        list.push(timeoutId);
+      }
+    },
+
+    _timeoutEntryId(entry) {
+      return entry && typeof entry === "object" && entry.id != null ? entry.id : entry;
+    },
+
+    _removeTrackedTimeout(key, timeoutId) {
+      if (!this.activeTimeouts.has(key)) return;
+      const list = this.activeTimeouts.get(key);
+      const index = list.findIndex((entry) => this._timeoutEntryId(entry) === timeoutId);
+      if (index > -1) list.splice(index, 1);
+      if (list.length === 0) this.activeTimeouts.delete(key);
+    },
+
+    _clearAllTimeouts(key) {
+      if (!this.activeTimeouts.has(key)) return;
+      const list = this.activeTimeouts.get(key);
+      list.forEach((entry) => clearTimeout(this._timeoutEntryId(entry)));
+      this.activeTimeouts.delete(key);
+    },
+
+    _clearTimeoutsByRole(key, rolesToCancel) {
+      if (!this.activeTimeouts.has(key)) return;
+      const list = this.activeTimeouts.get(key);
+      const keep = [];
+      let cleared = 0;
+      for (const entry of list) {
+        const role = entry && typeof entry === "object" ? entry.role : null;
+        if (role && rolesToCancel.includes(role)) {
+          clearTimeout(this._timeoutEntryId(entry));
+          cleared++;
+        } else {
+          keep.push(entry);
+        }
+      }
+      if (keep.length) this.activeTimeouts.set(key, keep);
+      else this.activeTimeouts.delete(key);
+      if (cleared) {
+        Logger.info(`Cancelled ${cleared} timeout(s) [${rolesToCancel.join(", ")}] for ${key}`);
+      }
+    },
+
+    _isMenuFamilyScene(scene) {
+      if (!scene) return false;
+      const MenuBase = typeof Scene_MenuBase !== "undefined" ? Scene_MenuBase : null;
+      if (typeof MenuBase !== "function") return false;
+      try {
+        // SceneManager._nextScene is a constructor, not an instance.
+        if (typeof scene === "function") {
+          return scene === MenuBase || (scene.prototype && scene.prototype instanceof MenuBase);
+        }
+        return scene instanceof MenuBase;
+      } catch (_e) {
+        return false;
+      }
+    },
+
+    _pauseMenuModeTracks() {
+      for (const [key, buffer] of this.tracks.entries()) {
+        if (buffer._pauseMode === "menu" && !this.pausedTracks.has(key)) {
+          const [type, trackId] = key.split("_");
+          this.pauseAudio(type, trackId, []);
+        }
+      }
+    },
+
+    _resumeMenuModeTracks() {
+      const menuPausedTracks = Array.from(this.pausedTracks).filter((key) => {
+        const buffer = this.tracks.get(key);
+        return buffer && buffer._pauseMode === "menu";
+      });
+      menuPausedTracks.forEach((key) => {
+        const [type, trackId] = key.split("_");
+        this.resumeAudio(type, trackId, []);
+        Logger.info(`Resumed ${key} after menu exit`);
+      });
+    },
+
+    _resumeSceneModeTracks() {
+      const scenePausedTracks = Array.from(this.pausedTracks).filter((key) => {
+        const buffer = this.tracks.get(key);
+        const snap = this.pausedSnapshots.get(key);
+        return buffer && buffer._pauseMode === "scene" && snap && snap._autoScenePause;
+      });
+      scenePausedTracks.forEach((key) => {
+        const [type, trackId] = key.split("_");
+        this.resumeAudio(type, trackId, []);
+        Logger.info(`Resumed ${key} after scene transition`);
+      });
+    },
+
+    /**
+     * Reset mixer + satellite runtime (B25). Satellites may register onResetRuntime hooks.
+     * @param {{ stop?: boolean }} [options] - stop:true (default) calls stopAll(0) first
+     */
+    resetRuntime(options) {
+      const opts = options && typeof options === "object" ? options : {};
+      const doStop = opts.stop !== false;
+
+      if (doStop) {
+        this.stopAll(0);
+      }
+
+      FadeManager.cancelAllFades();
+      this.namedSnapshots.clear();
+      this.pausedTracks.clear();
+      this.pausedSnapshots.clear();
+      this._savedGlobalMeta = null;
+      this.proximityErrors.clear();
+      this.lastPlayerX = null;
+      this.lastPlayerY = null;
+
+      if (this.SwitchBuffer && typeof this.SwitchBuffer.clearAll === "function") {
+        this.SwitchBuffer.clearAll();
+      }
+      if (this.sfxAliases && typeof this.sfxAliases.clear === "function") {
+        this.sfxAliases.clear();
+      }
+      if (this.aliasLastPlayed && typeof this.aliasLastPlayed.clear === "function") {
+        this.aliasLastPlayed.clear();
+      }
+      if (this.proximityData && typeof this.proximityData.clear === "function") {
+        this.proximityData.clear();
+      }
+      if (this.panSweeps && typeof this.panSweeps.clear === "function") {
+        this.panSweeps.clear();
+      }
+      if (this.sidechainConnections) {
+        for (const [connKey, conn] of this.sidechainConnections.entries()) {
+          this._disposeSidechainConnection(connKey, conn, { restoreTarget: true });
+        }
+        this.sidechainConnections.clear();
+      }
+
+      this.pumpConfig = {
+        active: false,
+        bpm: 120,
+        depth: 0,
+        shape: "sine",
+        tracks: "all",
+        startTime: 0,
+      };
+      if (typeof this._stopPumpRaf === "function") this._stopPumpRaf();
+
+      this._runHooks(this._resetRuntimeHooks);
+      Logger.success("Fugs audio runtime reset");
+    },
 
     _runHooks(list, ...args) {
       if (!list || !list.length) return;
@@ -832,14 +1048,22 @@
         case "stop":
           return this.stopAudio(type, trackId, this.toNum(args[0], 0));
 
-        case "fade":
+        case "fade": {
+          let fadeArgs = args.slice();
+          let fadeCurve = parsedCurve;
+          if (!fadeCurve) {
+            const detected = this._detectPositionalCurve(fadeArgs);
+            fadeArgs = detected.args;
+            fadeCurve = detected.curve;
+          }
           return this.fadeAudio(type, trackId, {
-            volume: args[0] !== undefined ? this.toNum(args[0]) : undefined,
-            duration: this.toNum(args[1], 0),
-            pan: args[2] !== undefined ? this.toNum(args[2]) : undefined,
-            pitch: args[3] !== undefined ? this.toNum(args[3]) : undefined,
-            curve: parsedCurve || args[4] || "smooth",
+            volume: fadeArgs[0] !== undefined ? this.toNum(fadeArgs[0]) : undefined,
+            duration: this.toNum(fadeArgs[1], 0),
+            pan: fadeArgs[2] !== undefined ? this.toNum(fadeArgs[2]) : undefined,
+            pitch: fadeArgs[3] !== undefined ? this.toNum(fadeArgs[3]) : undefined,
+            curve: fadeCurve || "smooth",
           });
+        }
 
         case "duck":
           return this.duckVolume(
@@ -1027,7 +1251,7 @@
           return this.listall("all");
 
         case "fadeall":
-          return this.fadeAllAudio(args);
+          return this.fadeAllAudio(args, commandObject.curve);
 
         case "duckall":
           return this.duckAllAudio(args, switchId);
@@ -1063,7 +1287,7 @@
         case "fadeall-me":
         case "fadeall-se": {
           const fadeallType = action.split("-")[1]; // Extract bgm/bgs/me/se
-          return this.fadeAllOfType(fadeallType, args);
+          return this.fadeAllOfType(fadeallType, args, commandObject.curve);
         }
 
         case "duckall-bgm":
@@ -1143,7 +1367,10 @@
           // syncplay TrackName1 TrackName2 ... [vol1 vol2 ...] or
           // syncplay-bgm TrackName1 TrackName2 ... [vol1 vol2 ...]
           // Volumes are optional, default to 90 for first track, 0 for rest
-          return this.syncPlay(type, args);
+          return this.syncPlay(type, args, {
+            persistence: commandObject.persistence,
+            pauseMode: commandObject.pauseMode,
+          });
 
         case "sidechain":
           // sidechain <sourceId> <targetId> [threshold] [ratio] [attack] [release]
@@ -1153,21 +1380,35 @@
           // stopsidechain <sourceId> <targetId>
           return this.stopSidechain(args);
 
-        case "pitch":
-          // pitch-bgm1 120 [duration] [curve] — shorthand for pitch-only fade
+        case "pitch": {
+          let pitchArgs = args.slice();
+          let pitchCurve = parsedCurve;
+          if (!pitchCurve) {
+            const detected = this._detectPositionalCurve(pitchArgs);
+            pitchArgs = detected.args;
+            pitchCurve = detected.curve;
+          }
           return this.fadeAudio(type, trackId, {
-            pitch: args[0] !== undefined ? this.toNum(args[0]) : undefined,
-            duration: this.toNum(args[1], 0),
-            curve: parsedCurve || args[2] || "smooth",
+            pitch: pitchArgs[0] !== undefined ? this.toNum(pitchArgs[0]) : undefined,
+            duration: this.toNum(pitchArgs[1], 0),
+            curve: pitchCurve || "smooth",
           });
+        }
 
-        case "pan":
-          // pan-bgm1 -50 [duration] [curve] — shorthand for pan-only fade
+        case "pan": {
+          let panArgs = args.slice();
+          let panCurve = parsedCurve;
+          if (!panCurve) {
+            const detected = this._detectPositionalCurve(panArgs);
+            panArgs = detected.args;
+            panCurve = detected.curve;
+          }
           return this.fadeAudio(type, trackId, {
-            pan: args[0] !== undefined ? this.toNum(args[0]) : undefined,
-            duration: this.toNum(args[1], 0),
-            curve: parsedCurve || args[2] || "smooth",
+            pan: panArgs[0] !== undefined ? this.toNum(panArgs[0]) : undefined,
+            duration: this.toNum(panArgs[1], 0),
+            curve: panCurve || "smooth",
           });
+        }
 
         case "doppler":
           // doppler-bgm1 {event:5, maxDistance:10} — proximity with doppler forced on
@@ -1195,21 +1436,6 @@
     _scheduleTrackEndAction(key, buffer, offsetSeconds = 0) {
       if (!buffer || !key) return;
 
-      const trackTimeout = (timeoutId) => {
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
-      };
-
-      const removeTrackedTimeout = (timeoutId) => {
-        if (!this.activeTimeouts.has(key)) return;
-        const list = this.activeTimeouts.get(key);
-        const index = list.indexOf(timeoutId);
-        if (index > -1) list.splice(index, 1);
-        if (list.length === 0) this.activeTimeouts.delete(key);
-      };
-
       const schedule = () => {
         if (this.tracks.get(key) !== buffer) return;
         if (buffer._fugsManualStop) return;
@@ -1219,15 +1445,25 @@
           typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
 
         if (totalTime <= 0) {
+          buffer._fugsEndActionRetries = (buffer._fugsEndActionRetries || 0) + 1;
+          if (buffer._fugsEndActionRetries > 50) {
+            Logger.warn(
+              `End timer gave up for ${key} after 50 retries (_totalTime=${totalTime}) — cleaning up`
+            );
+            this.cleanupTrack(key);
+            this.tracks.delete(key);
+            return;
+          }
           const retryId = setTimeout(schedule, 200);
-          trackTimeout(retryId);
+          this._trackTimeout(key, retryId, "endAction");
           return;
         }
 
+        buffer._fugsEndActionRetries = 0;
         const remaining = Math.max(0, totalTime - (offsetSeconds || 0));
         const delayMs = Math.max(50, (remaining / pitchNow) * 1000 + 60);
         const timeoutId = setTimeout(() => {
-          removeTrackedTimeout(timeoutId);
+          this._removeTrackedTimeout(key, timeoutId);
           if (this.tracks.get(key) !== buffer) return;
           if (buffer._fugsManualStop) return;
 
@@ -1249,7 +1485,7 @@
           this.tracks.delete(key);
           this.cleanupTrack(key);
         }, delayMs);
-        trackTimeout(timeoutId);
+        this._trackTimeout(key, timeoutId, "endAction");
       };
 
       if (
@@ -1351,6 +1587,7 @@
 
         // Manual volume tracking for proximity audio compatibility
         buffer._manualVolume = volume / 100; // Track user-set volume separately
+        buffer._manualPan = Math.max(-1, Math.min(1, pan / 100));
 
         // Pitch System Initialization
         buffer._basePitch = Math.max(0.1, Math.min(4, pitch / 100));
@@ -1445,7 +1682,15 @@
      * @param {string} type - Audio type (bgm, bgs, etc.)
      * @param {array} args - [name1, name2, ..., vol1, vol2, ...] or just [name1, name2, ...]
      */
-    syncPlay(type, args) {
+    syncPlay(type, args, options) {
+      const opts = options && typeof options === "object" ? options : {};
+      // B29: dashless syncplay parses as type "all" — default to bgm for stem mixing
+      if (type === "all") type = "bgm";
+
+      const stemPersistence =
+        opts.persistence != null ? opts.persistence : DefaultPersistenceMode;
+      const stemPauseMode = opts.pauseMode != null ? opts.pauseMode : DefaultPauseMode;
+
       if (!args || args.length === 0) {
         Logger.error("syncPlay requires at least one track name");
         return false;
@@ -1507,8 +1752,8 @@
           }
 
           buffer._name = name;
-          buffer._persistence = DefaultPersistenceMode;
-          buffer._pauseMode = DefaultPauseMode;
+          buffer._persistence = stemPersistence;
+          buffer._pauseMode = stemPauseMode;
           buffer._originalVolume = volumes[i] / 100;
           buffer._syncGroup = `sync_${Date.now()}`; // Tag for sync group identification
 
@@ -1562,7 +1807,7 @@
         return false;
       }
 
-      // Schedule start slightly in the future to ensure all are ready
+      // B28: schedule start slightly in the future, then re-start sources at that time
       const startTime = WebAudio._context.currentTime + 0.05; // 50ms buffer
 
       Logger.info(
@@ -1573,6 +1818,8 @@
         // Set initial volume
         buffer.volume = Math.max(0, Math.min(1, volume / 100));
         buffer.pan = 0;
+        buffer._manualVolume = volume / 100;
+        buffer._manualPan = 0;
 
         // Pitch initialization
         buffer._basePitch = 1.0;
@@ -1582,16 +1829,22 @@
         // Store in tracks map
         this.tracks.set(key, buffer);
 
-        // Start with loop enabled, at the scheduled time
-        // We need to access the internal WebAudio source node
         try {
-          // First call play() to create the source node infrastructure
           buffer.play(true, 0);
 
-          // The buffer is now playing from "now", but we want precise sync
-          // For truly sample-accurate sync, we'd need to access _sourceNode.start(when)
-          // RPG Maker's buffer.play() doesn't expose this, so this is "close enough"
-          // The 50ms scheduling window helps, but it's not perfect
+          // B28: if source node exists, stop the immediate start and re-schedule at startTime
+          if (buffer._sourceNode && typeof buffer._sourceNode.start === "function") {
+            try {
+              buffer._sourceNode.stop();
+            } catch (_stopErr) {
+              /* may not have started yet */
+            }
+            try {
+              buffer._sourceNode.start(startTime);
+            } catch (startErr) {
+              Logger.warn(`syncPlay: Could not schedule ${key} at ${startTime}: ${startErr.message}`);
+            }
+          }
 
           Logger.success(`syncPlay: Started ${key} (${buffer._name}) at ${volume}% volume`);
         } catch (error) {
@@ -1641,11 +1894,7 @@
       }
 
       // Cancel any pending timeouts for this track immediately (e.g. finite-loop end timers)
-      if (this.activeTimeouts.has(key)) {
-        const timeoutIds = this.activeTimeouts.get(key);
-        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
-        this.activeTimeouts.delete(key);
-      }
+      this._clearAllTimeouts(key);
 
       if (fadeout > 0) {
         Logger.info(`Stopping ${key} with ${fadeout}s fadeout`);
@@ -1684,19 +1933,11 @@
           }
 
           // Remove timeout from tracking
-          if (this.activeTimeouts.has(key)) {
-            const timeouts = this.activeTimeouts.get(key);
-            const index = timeouts.indexOf(timeoutId);
-            if (index > -1) timeouts.splice(index, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(key);
-          }
+          this._removeTrackedTimeout(key, timeoutId);
         }, fadeout * 1000);
 
         // Track this timeout for cleanup
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
+        this._trackTimeout(key, timeoutId, "crossfadeStop");
       } else {
         // Disconnect pump gain node before stopping
         if (buffer._pumpGainNode) {
@@ -1796,6 +2037,7 @@
             const buf = this.tracks.get(key);
             if (!buf) return; // Track was stopped/replaced
             buf.pan = Math.max(-1, Math.min(1, value));
+            buf._manualPan = buf.pan;
           },
           checkComplete,
           curve
@@ -1837,11 +2079,12 @@
     },
 
     // Global fade functions
-    fadeAllAudio(args) {
+    fadeAllAudio(args, curve) {
       const volume = this.toNum(args[0]);
       const duration = this.toNum(args[1], 0);
       const pan = args[2] !== undefined ? this.toNum(args[2]) : undefined;
       const pitch = args[3] !== undefined ? this.toNum(args[3]) : undefined;
+      const fadeCurve = curve || "smooth";
 
       let count = 0;
       let completed = 0;
@@ -1854,7 +2097,7 @@
 
         const [type, trackId] = key.split("_");
         if (
-          this.fadeAudio(type, trackId, { volume, duration, pan, pitch }, () => {
+          this.fadeAudio(type, trackId, { volume, duration, pan, pitch, curve: fadeCurve }, () => {
             completed++;
             if (completed === count) {
               Logger.success(`Global fade complete: ${count} tracks faded`);
@@ -1869,11 +2112,12 @@
       return count;
     },
 
-    fadeAllOfType(type, args) {
+    fadeAllOfType(type, args, curve) {
       const volume = args[0] !== undefined ? this.toNum(args[0]) : undefined;
       const duration = this.toNum(args[1], 0);
       const pan = args[2] !== undefined ? this.toNum(args[2]) : undefined;
       const pitch = args[3] !== undefined ? this.toNum(args[3]) : undefined;
+      const fadeCurve = curve || "smooth";
       let count = 0;
       let completed = 0;
 
@@ -1888,7 +2132,7 @@
 
           const trackId = key.split("_")[1];
           if (
-            this.fadeAudio(type, trackId, { volume, duration, pan, pitch }, () => {
+            this.fadeAudio(type, trackId, { volume, duration, pan, pitch, curve: fadeCurve }, () => {
               completed++;
               if (completed === count) {
                 Logger.success(`${type.toUpperCase()} fade complete: ${count} tracks faded`);
@@ -1972,8 +2216,8 @@
       const pausedSnapshot = {
         name: buffer._name,
         pos: currentTime,
-        volume: buffer.volume,
-        pan: buffer.pan,
+        volume: this._getMixerVolume(buffer),
+        pan: this._getMixerPan(buffer),
         pitch: buffer._basePitch || buffer.pitch,
         persistence: buffer._persistence,
         pauseMode: buffer._pauseMode,
@@ -1987,8 +2231,8 @@
 
       // Also save on buffer for backward compatibility
       buffer._pausedPos = currentTime; // Position in seconds
-      buffer._pausedVolume = buffer.volume;
-      buffer._pausedPan = buffer.pan;
+      buffer._pausedVolume = this._getMixerVolume(buffer);
+      buffer._pausedPan = this._getMixerPan(buffer);
       buffer._pausedPitch = buffer.pitch;
 
       Logger.info(`Pausing ${key} at position: ${currentTime}s`);
@@ -2003,13 +2247,8 @@
         this.stopPanSweep(type, trackId);
       }
 
-      // Cancel pending timeouts for this track (end timers, prior pause fades)
-      if (this.activeTimeouts.has(key)) {
-        const timeoutIds = this.activeTimeouts.get(key);
-        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
-        this.activeTimeouts.delete(key);
-        Logger.info(`Cancelled ${timeoutIds.length} pending timeout(s) for paused ${key}`);
-      }
+      // B38: pause only cancels timeouts that must die with pause (not chain/duckRestore/crossfade)
+      this._clearTimeoutsByRole(key, ["pauseStop", "endAction"]);
 
       // B16: mark paused immediately so resume works during fadeout
       this.pausedTracks.add(key);
@@ -2043,19 +2282,11 @@
           }
 
           // Remove timeout from tracking
-          if (this.activeTimeouts.has(key)) {
-            const timeouts = this.activeTimeouts.get(key);
-            const index = timeouts.indexOf(timeoutId);
-            if (index > -1) timeouts.splice(index, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(key);
-          }
+          this._removeTrackedTimeout(key, timeoutId);
         }, pauseDelay * 1000);
 
         // Track this timeout for cleanup / resume cancel
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
+        this._trackTimeout(key, timeoutId, "pauseStop");
       } else {
         try {
           buffer.stop();
@@ -2076,12 +2307,7 @@
       }
 
       // B16: cancel pending pause-stop timeout and in-progress pause fades
-      if (this.activeTimeouts.has(key)) {
-        const timeoutIds = this.activeTimeouts.get(key);
-        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
-        this.activeTimeouts.delete(key);
-        Logger.info(`Cancelled ${timeoutIds.length} pending timeout(s) for resume ${key}`);
-      }
+      this._clearTimeoutsByRole(key, ["pauseStop"]);
       FadeManager.cancelFade(`${key}_volume`);
       FadeManager.cancelFade(`${key}_pan`);
       FadeManager.cancelFade(`${key}_pitch`);
@@ -2470,12 +2696,7 @@
       }
 
       // Cancel any pending timeouts for this track
-      if (this.activeTimeouts.has(key)) {
-        const timeoutIds = this.activeTimeouts.get(key);
-        timeoutIds.forEach((timeoutId) => clearTimeout(timeoutId));
-        this.activeTimeouts.delete(key);
-        Logger.info(`Cancelled ${timeoutIds.length} pending timeout(s) for ${key}`);
-      }
+      this._clearAllTimeouts(key);
 
       // Disconnect and cleanup effect chains (reuse _disposeEffectChain for proper
       // node nullification, buffer clearing, and reference cleanup on older Chromium)
@@ -2596,16 +2817,16 @@
           ? pausedSnapshot.volume
           : buffer._pausedVolume != null
             ? buffer._pausedVolume
-            : buffer.volume
-        : buffer.volume;
+            : this._getMixerVolume(buffer)
+        : this._getMixerVolume(buffer);
 
       const pan = isPaused
         ? pausedSnapshot && pausedSnapshot.pan != null
           ? pausedSnapshot.pan
           : buffer._pausedPan != null
             ? buffer._pausedPan
-            : buffer.pan
-        : buffer.pan;
+            : this._getMixerPan(buffer)
+        : this._getMixerPan(buffer);
 
       const pitch = isPaused
         ? pausedSnapshot && pausedSnapshot.pitch != null
@@ -2705,11 +2926,15 @@
       if (this.playAudio(options)) {
         // If the track was paused when saved, re-pause after restoring.
         if (state.isPaused) {
-          this._restorePausedTrack(key, type, trackId, state);
+          this._restorePausedTrack(key, type, trackId, state, () => {
+            // B45: run restore hooks after pause snapshot is stored (not before deferred pause)
+            this._runRestoreHooks(key, state.ext);
+          });
+        } else {
+          // B06: let satellites (proximity/spatial) re-bind their saved state now
+          // that the track exists again.
+          this._runRestoreHooks(key, state.ext);
         }
-        // B06: let satellites (proximity/spatial) re-bind their saved state now
-        // that the track exists again.
-        this._runRestoreHooks(key, state.ext);
         Logger.info(`Restored state for ${key}${state.isPaused ? " (paused)" : ""}`);
         return true;
       }
@@ -2722,7 +2947,7 @@
     // both lose the saved position and briefly play audio. Wait for the buffer to
     // be ready before stopping, then overwrite the paused snapshot's position with
     // the authoritative saved value.
-    _restorePausedTrack(key, type, trackId, state) {
+    _restorePausedTrack(key, type, trackId, state, onComplete) {
       const buffer = this.tracks.get(key);
       const savedPos = this.toNum(state.currentTime, 0);
 
@@ -2733,8 +2958,19 @@
 
         // Force the authoritative saved position (seek() on a cold buffer is 0).
         const snap = this.pausedSnapshots.get(key);
-        if (snap) snap.pos = savedPos;
-        if (buffer) buffer._pausedPos = savedPos;
+        if (snap) {
+          snap.pos = savedPos;
+          // B34/B45: keep saved mixer volume/pan in the pause snapshot
+          if (state.volume != null) snap.volume = state.volume;
+          if (state.pan != null) snap.pan = state.pan;
+        }
+        if (buffer) {
+          buffer._pausedPos = savedPos;
+          if (state.volume != null) buffer._pausedVolume = state.volume;
+          if (state.pan != null) buffer._pausedPan = state.pan;
+        }
+
+        if (typeof onComplete === "function") onComplete();
       };
 
       const supportsReady = buffer && typeof buffer.isReady === "function";
@@ -2755,6 +2991,17 @@
       if (!snapshot) {
         Logger.warn(`No saved snapshot found: ${stateName}`);
         return false;
+      }
+
+      // B17: stop live tracks absent from the snapshot before restore
+      const snapshotKeys = new Set(snapshot.keys());
+      for (const key of Array.from(this.tracks.keys())) {
+        if (!snapshotKeys.has(key)) {
+          const parts = key.split("_");
+          if (parts.length >= 2) {
+            this.stopAudio(parts[0], parts[1], 0);
+          }
+        }
       }
 
       let count = 0;
@@ -3018,7 +3265,7 @@
         (val) => allowed.has(val)
       );
 
-      return { args: parsed.args, curve: parsed.value != null ? parsed.value : "smooth" };
+      return { args: parsed.args, curve: parsed.value };
     },
     checkPersistence(args) {
       const allowed = new Set(["always", "battle", "scene", "none"]);
@@ -3116,6 +3363,11 @@
         if (shouldPause) {
           const [type, trackId] = key.split("_");
           this.pauseAudio(type, trackId, [fadeoutDuration]);
+          // B18: mark scene auto-pauses so map start can resume without waking saved-as-paused tracks
+          if (pauseMode === "scene" && transitionType === "scene") {
+            const snap = this.pausedSnapshots.get(key);
+            if (snap) snap._autoScenePause = true;
+          }
         } else if (shouldStop) {
           const [type, trackId] = key.split("_");
 
@@ -3284,19 +3536,11 @@
           }
 
           // Remove timeout from tracking
-          if (this.activeTimeouts.has(fromKey)) {
-            const timeouts = this.activeTimeouts.get(fromKey);
-            const index = timeouts.indexOf(timeoutId);
-            if (index > -1) timeouts.splice(index, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(fromKey);
-          }
+          this._removeTrackedTimeout(fromKey, timeoutId);
         }, duration * 1000);
 
         // Track this timeout for cleanup
-        if (!this.activeTimeouts.has(fromKey)) {
-          this.activeTimeouts.set(fromKey, []);
-        }
-        this.activeTimeouts.get(fromKey).push(timeoutId);
+        this._trackTimeout(fromKey, timeoutId, "crossfadeStop");
       }
 
       // Fade in new track - wait for buffer to be ready first
@@ -3381,19 +3625,11 @@
           this.executeCommand(commandObj);
 
           // Remove timeout from tracking
-          if (this.activeTimeouts.has(key)) {
-            const timeouts = this.activeTimeouts.get(key);
-            const idx = timeouts.indexOf(timeoutId);
-            if (idx > -1) timeouts.splice(idx, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(key);
-          }
+          this._removeTrackedTimeout(key, timeoutId);
         }, currentDelay);
 
         // Track this timeout for cleanup
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
+        this._trackTimeout(key, timeoutId, "chain");
       });
 
       return true;
@@ -3884,7 +4120,7 @@
     const _Scene_Title_start = Scene_Title.prototype.start;
     Scene_Title.prototype.start = function () {
       _Scene_Title_start.call(this);
-      FugsMultiTrackAudioEX.stopAll(SceneFadeoutTime);
+      FugsMultiTrackAudioEX.resetRuntime({ stop: true });
     };
 
     const _DataManager_loadGame = DataManager.loadGame;
@@ -3903,7 +4139,14 @@
     const _DataManager_setupNewGame = DataManager.setupNewGame;
     DataManager.setupNewGame = function () {
       _DataManager_setupNewGame.call(this);
-      FugsMultiTrackAudioEX.handleSceneTransition("scene", SceneFadeoutTime);
+      FugsMultiTrackAudioEX.resetRuntime({ stop: true });
+    };
+
+    const _Scene_Map_start = Scene_Map.prototype.start;
+    Scene_Map.prototype.start = function () {
+      _Scene_Map_start.call(this);
+      // B18: resume tracks auto-paused for scene transitions (map transfer, battle return)
+      FugsMultiTrackAudioEX._resumeSceneModeTracks();
     };
 
     const _Scene_Map_create = Scene_Map.prototype.create;
@@ -3957,36 +4200,31 @@
       }
     };
 
-    const _Scene_Menu_start = Scene_Menu.prototype.start;
-    Scene_Menu.prototype.start = function () {
-      _Scene_Menu_start.call(this);
-      for (const [key, buffer] of FugsMultiTrackAudioEX.tracks.entries()) {
-        if (buffer._pauseMode === "menu" && !FugsMultiTrackAudioEX.pausedTracks.has(key)) {
-          const [type, trackId] = key.split("_");
-          FugsMultiTrackAudioEX.pauseAudio(type, trackId, []);
+    if (typeof Scene_MenuBase !== "undefined" && Scene_MenuBase.prototype) {
+      const _Scene_MenuBase_start = Scene_MenuBase.prototype.start;
+      Scene_MenuBase.prototype.start = function () {
+        if (typeof _Scene_MenuBase_start === "function") _Scene_MenuBase_start.call(this);
+        // B19: pause menu-mode tracks for any menu-family scene (Item, Shop, Name, etc.)
+        FugsMultiTrackAudioEX._pauseMenuModeTracks();
+      };
+
+      const _Scene_MenuBase_terminate = Scene_MenuBase.prototype.terminate;
+      Scene_MenuBase.prototype.terminate = function () {
+        if (typeof _Scene_MenuBase_terminate === "function") _Scene_MenuBase_terminate.call(this);
+        if (!FugsMultiTrackAudioEX._isMenuFamilyScene(SceneManager._nextScene)) {
+          FugsMultiTrackAudioEX._resumeMenuModeTracks();
         }
-      }
-    };
+      };
+    }
 
-    const _Scene_Menu_terminate = Scene_Menu.prototype.terminate;
-    Scene_Menu.prototype.terminate = function () {
-      _Scene_Menu_terminate.call(this);
-      // Collect keys FIRST into array to avoid iterator invalidation
-      // (resumeAudio modifies pausedTracks Set during iteration)
-      const menuPausedTracks = Array.from(FugsMultiTrackAudioEX.pausedTracks).filter((key) => {
-        const buffer = FugsMultiTrackAudioEX.tracks.get(key);
-        return buffer && buffer._pauseMode === "menu";
-      });
-
-      menuPausedTracks.forEach((key) => {
-        const [type, trackId] = key.split("_");
-        FugsMultiTrackAudioEX.resumeAudio(type, trackId, []);
-        Logger.info(`Resumed ${key} after menu exit`);
-      });
-    };
-
-    // Note: Proximity audio update is handled in Scene_Map.prototype.update
-    // to avoid duplicate calls per frame
+    if (typeof Scene_Gameover !== "undefined" && Scene_Gameover.prototype) {
+      const _Scene_Gameover_start = Scene_Gameover.prototype.start;
+      Scene_Gameover.prototype.start = function () {
+        if (typeof _Scene_Gameover_start === "function") _Scene_Gameover_start.call(this);
+        // B20: stop all Fugs tracks on game over
+        FugsMultiTrackAudioEX.stopAll(0);
+      };
+    }
 
     // DataManager hooks for save/load integration
     const _DataManager_makeSaveContents = DataManager.makeSaveContents;
@@ -4231,13 +4469,18 @@
           let node;
 
           switch (effect.type) {
-            case "reverb":
-              node = this.context.createConvolver();
-              node.buffer = this.createReverbBuffer(
+            case "reverb": {
+              const reverbNode = this.context.createConvolver();
+              reverbNode.buffer = this.createReverbBuffer(
                 effect.duration || AUDIO_CONSTANTS.DEFAULT_REVERB_DURATION,
                 effect.decay || AUDIO_CONSTANTS.DEFAULT_REVERB_DECAY
               );
+              currentNode.connect(reverbNode);
+              reverbNode.connect(chain.wetGain);
+              chain.nodes.push(reverbNode);
+              node = null; // Parallel send — inserts stay on the main path
               break;
+            }
 
             case "lowpass":
               node = this.context.createBiquadFilter();
@@ -4328,8 +4571,10 @@
               break;
 
             case "delay": {
-              node = this.context.createDelay(effect.maxDelay || AUDIO_CONSTANTS.DEFAULT_DELAY_MAX);
-              node.delayTime.value = effect.delay || AUDIO_CONSTANTS.DEFAULT_DELAY_TIME;
+              const delayTime = effect.delay || AUDIO_CONSTANTS.DEFAULT_DELAY_TIME;
+              const maxDelay = effect.maxDelay || AUDIO_CONSTANTS.DEFAULT_DELAY_MAX;
+              node = this.context.createDelay(Math.max(maxDelay, delayTime, 1));
+              node.delayTime.value = delayTime;
               const delayFeedback = this.context.createGain();
               delayFeedback.gain.value = effect.feedback || AUDIO_CONSTANTS.DEFAULT_FEEDBACK;
               const delayWet = this.context.createGain();
@@ -4386,9 +4631,10 @@
                 const maxDelay = effect.maxDelay || 1;
 
                 taps.forEach((tap) => {
-                  const tapDelay = this.context.createDelay(maxDelay);
-                  tapDelay.delayTime.value =
+                  const tapDelayTime =
                     tap.delay || AUDIO_CONSTANTS.MULTITAP_TAP_DELAY_FALLBACK;
+                  const tapDelay = this.context.createDelay(Math.max(maxDelay, tapDelayTime, 1));
+                  tapDelay.delayTime.value = tapDelayTime;
 
                   const tapFeedback = this.context.createGain();
                   tapFeedback.gain.value =
@@ -4717,13 +4963,10 @@
           }
         });
 
-        // Connect wet/dry paths
-        chain.input.connect(chain.dryGain);
+        // B37: inserts ride the main path into dryGain; send effects tap wetGain.
+        // Never wire input→dryGain directly — that bypassed insert filters.
+        currentNode.connect(chain.dryGain);
         chain.dryGain.connect(chain.output);
-
-        if (currentNode !== chain.input) {
-          currentNode.connect(chain.wetGain);
-        }
         chain.wetGain.connect(chain.output);
 
         return chain;
@@ -5459,6 +5702,76 @@
   };
 
   // --- Track-level effect integration (lives on hub) ---
+  // Send effects tap the wet bus; everything else is 100% in-series on the main path.
+  const SEND_EFFECT_TYPES = {
+    reverb: true,
+    delay: true,
+    chorus: true,
+    multitap: true,
+  };
+
+  hub._clearEffectCrossfadeTimeouts = function(key) {
+    if (!this._effectCrossfadeTimeouts || !this._effectCrossfadeTimeouts.has(key)) return;
+    const timeouts = this._effectCrossfadeTimeouts.get(key);
+    timeouts.forEach((timeoutId) => clearTimeout(timeoutId));
+    this._effectCrossfadeTimeouts.delete(key);
+  };
+
+  hub._trackEffectCrossfadeTimeout = function(key, timeoutId) {
+    if (!this._effectCrossfadeTimeouts) this._effectCrossfadeTimeouts = new Map();
+    if (!this._effectCrossfadeTimeouts.has(key)) {
+      this._effectCrossfadeTimeouts.set(key, []);
+    }
+    this._effectCrossfadeTimeouts.get(key).push(timeoutId);
+  };
+
+  hub._untrackEffectCrossfadeTimeout = function(key, timeoutId) {
+    if (!this._effectCrossfadeTimeouts || !this._effectCrossfadeTimeouts.has(key)) return;
+    const timeouts = this._effectCrossfadeTimeouts.get(key);
+    const index = timeouts.indexOf(timeoutId);
+    if (index > -1) timeouts.splice(index, 1);
+    if (timeouts.length === 0) this._effectCrossfadeTimeouts.delete(key);
+  };
+
+  hub._tryConnectEffectChain = function(key, buffer) {
+    if (!this.effectChains.has(key) || !buffer) {
+      return { connected: false, queued: false };
+    }
+
+    if (this.connectEffectChain(key, buffer)) {
+      return { connected: true, queued: false };
+    }
+
+    const validation = AudioEffects.validateBuffer(buffer, key);
+    if (
+      validation.valid ||
+      !validation.reason ||
+      validation.reason.indexOf("_sourceNode") === -1
+    ) {
+      return { connected: false, queued: false };
+    }
+
+    if (typeof buffer.addLoadListener !== "function") {
+      return { connected: false, queued: false };
+    }
+
+    if (!this._effectConnectGen) this._effectConnectGen = new Map();
+    const connectGen = (this._effectConnectGen.get(key) || 0) + 1;
+    this._effectConnectGen.set(key, connectGen);
+
+    const self = this;
+    buffer.addLoadListener(function onEffectBufferReady() {
+      if (self._effectConnectGen.get(key) !== connectGen) return;
+      if (!self.effectChains.has(key)) return;
+      const currentBuffer = self.tracks.get(key);
+      if (!currentBuffer) return;
+      self.connectEffectChain(key, currentBuffer);
+    });
+
+    Logger.effect(`Queued effect-chain connect for ${key} until buffer is ready`);
+    return { connected: false, queued: true };
+  };
+
   hub.connectEffectChain = function(key, buffer) {
       const chain = this.effectChains.get(key);
       if (!chain) return false;
@@ -5681,6 +5994,11 @@
       // this key, so bump the generation token to abort its mid-point timeout.
       if (!this._effectCrossfadeGen) this._effectCrossfadeGen = new Map();
       this._effectCrossfadeGen.set(key, (this._effectCrossfadeGen.get(key) || 0) + 1);
+      this._clearEffectCrossfadeTimeouts(key);
+
+      // Supersede any pending cold-buffer connect retry for this key.
+      if (!this._effectConnectGen) this._effectConnectGen = new Map();
+      this._effectConnectGen.set(key, (this._effectConnectGen.get(key) || 0) + 1);
 
       // Clean up existing effect chain if present
       if (this.effectChains.has(key)) {
@@ -5778,18 +6096,24 @@
         effects = [effect];
       }
 
-      // Determine wet/dry mix from effect metadata (optional)
+      // Determine wet/dry mix from effect metadata (optional).
+      // B37: insert-only chains stay 100% on the main path (wetMix 0).
       const clamp01 = (v) => Math.max(0, Math.min(1, v));
-      let wetMix = 0.35; // sensible default
+      const hasSendEffect = effects.some(
+        (e) => e && typeof e === "object" && SEND_EFFECT_TYPES[e.type]
+      );
+      let wetMix = hasSendEffect ? 0.35 : 0;
 
-      // Priority: explicit wetMix on any effect, else first numeric "wet"
-      const mixSource = effects.find((e) => e && typeof e === "object" && e.wetMix !== undefined);
-      if (mixSource && typeof mixSource.wetMix === "number" && !isNaN(mixSource.wetMix)) {
-        wetMix = mixSource.wetMix;
-      } else {
-        const wetSource = effects.find((e) => e && typeof e === "object" && e.wet !== undefined);
-        if (wetSource && typeof wetSource.wet === "number" && !isNaN(wetSource.wet)) {
-          wetMix = wetSource.wet;
+      if (hasSendEffect) {
+        // Priority: explicit wetMix on any effect, else first numeric "wet"
+        const mixSource = effects.find((e) => e && typeof e === "object" && e.wetMix !== undefined);
+        if (mixSource && typeof mixSource.wetMix === "number" && !isNaN(mixSource.wetMix)) {
+          wetMix = mixSource.wetMix;
+        } else {
+          const wetSource = effects.find((e) => e && typeof e === "object" && e.wet !== undefined);
+          if (wetSource && typeof wetSource.wet === "number" && !isNaN(wetSource.wet)) {
+            wetMix = wetSource.wet;
+          }
         }
       }
       wetMix = clamp01(wetMix);
@@ -5802,8 +6126,6 @@
 
         const buffer = this.tracks.get(key);
         if (buffer) {
-          this.connectEffectChain(key, buffer);
-          // Persist the chosen effect on the buffer so save/resume/listall stay accurate.
           const effectKeyToStore =
             typeof effectConfig === "string"
               ? effectConfig
@@ -5815,6 +6137,14 @@
           if (this.pausedSnapshots && this.pausedSnapshots.has(key)) {
             const snap = this.pausedSnapshots.get(key);
             if (snap) snap.effect = effectKeyToStore;
+          }
+
+          const connectResult = this._tryConnectEffectChain(key, buffer);
+          if (!connectResult.connected && !connectResult.queued) {
+            Logger.warn(`Failed to connect effect chain for ${key}`);
+            this._disposeEffectChain(key, chain, buffer);
+            this.effectChains.delete(key);
+            return false;
           }
         }
 
@@ -5935,6 +6265,7 @@
       if (!this._effectCrossfadeGen) this._effectCrossfadeGen = new Map();
       const gen = (this._effectCrossfadeGen.get(key) || 0) + 1;
       this._effectCrossfadeGen.set(key, gen);
+      this._clearEffectCrossfadeTimeouts(key);
 
       // Start fade out of old effect
       this.fadeOutEffect(key, duration / 2);
@@ -5945,18 +6276,14 @@
           // B10: bail if a newer crossfade/effect superseded this one.
           if (this._effectCrossfadeGen.get(key) !== gen) {
             Logger.info(`Effect cross-fade for ${key} superseded — skipping new effect apply`);
-            if (this.activeTimeouts.has(key)) {
-              const timeouts = this.activeTimeouts.get(key);
-              const idx = timeouts.indexOf(timeoutId);
-              if (idx > -1) timeouts.splice(idx, 1);
-              if (timeouts.length === 0) this.activeTimeouts.delete(key);
-            }
+            this._untrackEffectCrossfadeTimeout(key, timeoutId);
             return;
           }
 
           // Check if track still exists before applying new effect
           if (!this.tracks.has(key)) {
             Logger.warn(`Effect cross-fade cancelled - track ${key} no longer exists`);
+            this._untrackEffectCrossfadeTimeout(key, timeoutId);
             return;
           }
 
@@ -5966,22 +6293,14 @@
           this.fadeEffect(key, newEffect, newEffectParams, duration / 2);
           Logger.success(`Effect cross-fade complete for ${key}: ${oldEffect} -> ${newEffect}`);
 
-          // Remove timeout from tracking
-          if (this.activeTimeouts.has(key)) {
-            const timeouts = this.activeTimeouts.get(key);
-            const index = timeouts.indexOf(timeoutId);
-            if (index > -1) timeouts.splice(index, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(key);
-          }
+          this._untrackEffectCrossfadeTimeout(key, timeoutId);
         },
         (duration / 2) * 1000
       );
 
-      // Track this timeout for cleanup
-      if (!this.activeTimeouts.has(key)) {
-        this.activeTimeouts.set(key, []);
-      }
-      this.activeTimeouts.get(key).push(timeoutId);
+      // B38-adjacent: keep crossfade midpoint timers off hub.activeTimeouts so
+      // core pause/stop does not cancel the pending apply.
+      this._trackEffectCrossfadeTimeout(key, timeoutId);
 
       return true;
   };
@@ -6120,6 +6439,12 @@
   hub.onTeardown(function (key) {
     const chain = this.effectChains && this.effectChains.get(key);
     if (!chain) return;
+    if (typeof this._clearEffectCrossfadeTimeouts === "function") {
+      this._clearEffectCrossfadeTimeouts(key);
+    }
+    if (this._effectConnectGen) {
+      this._effectConnectGen.set(key, (this._effectConnectGen.get(key) || 0) + 1);
+    }
     if (typeof this._disposeEffectChain === "function") {
       this._disposeEffectChain(key, chain, this.tracks.get(key), { restoreRouting: false });
     }
@@ -6283,6 +6608,69 @@
   if (!hub.proximityData) hub.proximityData = new Map();
   if (!hub.panSweeps) hub.panSweeps = new Map();
   if (!hub.proximityErrors) hub.proximityErrors = new Set();
+  if (!hub._proximityDeferVolumeUntilPause) hub._proximityDeferVolumeUntilPause = new Set();
+
+  hub._currentProximityMapId = null;
+
+  hub._resolveProximityMapId = function () {
+    if (typeof $gameMap === "undefined" || !$gameMap || typeof $gameMap.mapId !== "function") {
+      return null;
+    }
+    return $gameMap.mapId();
+  };
+
+  // B31: event-bound proximity is map-local — drop stale bindings after map transfer.
+  hub.revalidateEventProximityForMap = function () {
+    if (!this.proximityData || this.proximityData.size === 0) return;
+
+    const currentMapId = this._resolveProximityMapId();
+    this._currentProximityMapId = currentMapId;
+
+    for (const [key, config] of this.proximityData.entries()) {
+      if (!config || !config.eventId) continue;
+
+      if (currentMapId == null || config.mapId == null || config.mapId !== currentMapId) {
+        config.eventMapStale = true;
+        if (this.proximityErrors) {
+          const prefix = key + "_";
+          const filtered = new Set();
+          for (const errorKey of this.proximityErrors) {
+            if (!errorKey.startsWith(prefix)) filtered.add(errorKey);
+          }
+          this.proximityErrors = filtered;
+        }
+      } else {
+        config.eventMapStale = false;
+      }
+    }
+  };
+
+  // B36: do not overwrite silent fade-in starts; B45: defer while pause is pending.
+  hub._shouldSkipProximityVolumeWrite = function (key, buffer) {
+    if (!buffer) return true;
+
+    if (this._proximityDeferVolumeUntilPause && this._proximityDeferVolumeUntilPause.has(key)) {
+      if (!(this.pausedTracks && this.pausedTracks.has(key))) {
+        return true;
+      }
+      this._proximityDeferVolumeUntilPause.delete(key);
+    }
+
+    const volumeFadeKey = `${key}_volume`;
+    if (FadeManager.activeFades.has(volumeFadeKey)) return true;
+
+    if (typeof buffer.isReady === "function" && !buffer.isReady()) return true;
+
+    const manual =
+      buffer._manualVolume !== undefined && buffer._manualVolume !== null
+        ? buffer._manualVolume
+        : buffer._originalVolume;
+    if (buffer.volume === 0 && typeof manual === "number" && isFinite(manual) && manual > 0) {
+      return true;
+    }
+
+    return false;
+  };
 
   hub.parseProximityConfig = function(str) {
       // Flexible parser that supports nested arrays/objects and quoted strings.
@@ -6398,10 +6786,16 @@
         }
       }
 
+      const parsedEventId = config.event != null ? parseInt(config.event, 10) : undefined;
+      const hasEventBinding =
+        parsedEventId != null && Number.isInteger(parsedEventId) && parsedEventId >= 1;
+
       const proximityConfig = {
         x: config.x,
         y: config.y,
-        eventId: config.event != null ? parseInt(config.event, 10) : undefined,
+        eventId: hasEventBinding ? parsedEventId : undefined,
+        mapId: hasEventBinding ? this._resolveProximityMapId() : undefined,
+        eventMapStale: false,
         followPlayer: config.player,
         maxDistance:
           config.maxDistance !== undefined && config.maxDistance !== null
@@ -6441,6 +6835,11 @@
       if (typeof $dataMap === "undefined" || !$dataMap) return;
       if (typeof $gameMap === "undefined" || !$gameMap) return;
 
+      const currentMapId = this._resolveProximityMapId();
+      if (currentMapId != null && currentMapId !== this._currentProximityMapId) {
+        this.revalidateEventProximityForMap();
+      }
+
       const playerX = $gamePlayer.x;
       const playerY = $gamePlayer.y;
 
@@ -6454,6 +6853,17 @@
           sourceX = playerX;
           sourceY = playerY;
         } else if (config.eventId) {
+          if (config.eventMapStale) {
+            continue;
+          }
+          if (
+            config.mapId != null &&
+            currentMapId != null &&
+            config.mapId !== currentMapId
+          ) {
+            config.eventMapStale = true;
+            continue;
+          }
           try {
             // Validate event ID
             if (!Number.isInteger(config.eventId) || config.eventId < 1) {
@@ -6581,10 +6991,8 @@
           volumeMultiplier = curveFunc(distance, config.maxDistance);
         }
 
-        // Skip proximity volume control if a fade is in progress for this track
-        // This prevents proximity from overriding crossfades and other volume animations
-        const volumeFadeKey = `${key}_volume`;
-        if (!FadeManager.activeFades.has(volumeFadeKey)) {
+        // B36: skip volume writes while cold, fade-in is pending, or a fade is active.
+        if (!this._shouldSkipProximityVolumeWrite(key, buffer)) {
           const baseVolumeCandidate =
             buffer._manualVolume !== undefined && buffer._manualVolume !== null
               ? buffer._manualVolume
@@ -6815,6 +7223,7 @@
       FadeManager.cancelFade(key + "_pan");
     }
     if (this.proximityData) this.proximityData.delete(key);
+    if (this._proximityDeferVolumeUntilPause) this._proximityDeferVolumeUntilPause.delete(key);
     if (this.proximityErrors) {
       const prefix = key + "_";
       const filtered = new Set();
@@ -6835,6 +7244,7 @@
         x: cfg.x,
         y: cfg.y,
         eventId: cfg.eventId,
+        mapId: cfg.mapId,
         followPlayer: cfg.followPlayer,
         maxDistance: cfg.maxDistance,
         minVolume: cfg.minVolume,
@@ -6875,9 +7285,29 @@
         lastSourceY: undefined,
         lastTargetX: undefined,
         lastTargetY: undefined,
+        eventMapStale: false,
       });
+      if (restored.eventId) {
+        const currentMapId = this._resolveProximityMapId();
+        if (
+          restored.mapId == null ||
+          currentMapId == null ||
+          restored.mapId !== currentMapId
+        ) {
+          restored.eventMapStale = true;
+        }
+      }
       this.proximityData.set(key, restored);
-      if (typeof this.updateProximityVolume === "function") {
+      const buffer = this.tracks.get(key);
+      const pausePending =
+        (this.pausedTracks && this.pausedTracks.has(key)) ||
+        (this.pausedSnapshots && this.pausedSnapshots.has(key)) ||
+        (buffer && typeof buffer.isReady === "function" && !buffer.isReady());
+      // B45: restore proximity data only — applying volume while paused (or before a
+      // deferred cold pause snapshots buffer.volume) causes double attenuation on resume.
+      if (pausePending) {
+        this._proximityDeferVolumeUntilPause.add(key);
+      } else if (typeof this.updateProximityVolume === "function") {
         try {
           this.updateProximityVolume();
         } catch (e) {
@@ -6912,6 +7342,16 @@
       }
     }
   });
+
+  if (typeof Scene_Map !== "undefined" && Scene_Map.prototype) {
+    const _Spatial_Scene_Map_create = Scene_Map.prototype.create;
+    Scene_Map.prototype.create = function () {
+      if (typeof _Spatial_Scene_Map_create === "function") {
+        _Spatial_Scene_Map_create.call(this);
+      }
+      hub.revalidateEventProximityForMap();
+    };
+  }
 
   window.DistanceCurves = DistanceCurves;
   hub.DistanceCurves = DistanceCurves;
@@ -6955,9 +7395,90 @@
   }
 
   if (!hub.sidechainConnections) hub.sidechainConnections = new Map();
+  if (!hub._duckRestoreTimeouts) hub._duckRestoreTimeouts = new Map();
   if (!hub.pumpConfig) {
     hub.pumpConfig = { active: false, bpm: 120, depth: 0, shape: "sine", tracks: "all", startTime: 0 };
   }
+
+  let pumpRafId = null;
+
+  hub._startPumpRaf = function() {
+    if (pumpRafId != null) return;
+    const tick = () => {
+      if (!this.pumpConfig || !this.pumpConfig.active) {
+        pumpRafId = null;
+        return;
+      }
+      this.updatePump();
+      pumpRafId = requestAnimationFrame(tick);
+    };
+    pumpRafId = requestAnimationFrame(tick);
+  };
+
+  hub._stopPumpRaf = function() {
+    if (pumpRafId != null) {
+      try {
+        cancelAnimationFrame(pumpRafId);
+      } catch (_e) {}
+      pumpRafId = null;
+    }
+  };
+
+  // B23: re-attach sidechain analyser taps after gain-node rewiring.
+  hub._reconnectSidechainAnalyserTaps = function(buffer) {
+    if (!buffer || !buffer._gainNode || !this.sidechainConnections) return;
+    for (const conn of this.sidechainConnections.values()) {
+      if (!conn || !conn.active || !conn.analyzer || conn.sourceTrack !== buffer) continue;
+      try {
+        buffer._gainNode.connect(conn.analyzer);
+      } catch (_e) {
+        Logger.debugOnce(
+          "reconnectSidechainAnalyserTaps: connect failed",
+          {},
+          "reconnectSidechainAnalyserTaps.connect"
+        );
+      }
+    }
+  };
+
+  // B27: sidechain duck multiplier on a dedicated series node (not MV _gainNode.gain).
+  hub.ensureSidechainGainNode = function(buffer) {
+    if (!buffer || !buffer._gainNode) return false;
+    if (buffer._sidechainGainNode) return true;
+    if (!WebAudio._context) return false;
+
+    try {
+      buffer._sidechainGainNode = WebAudio._context.createGain();
+      buffer._sidechainGainNode.gain.value = 1.0;
+
+      const gain = buffer._gainNode;
+      const panner = buffer._pannerNode;
+      const pump = buffer._pumpGainNode;
+      const duck = buffer._sidechainGainNode;
+
+      if (pump) {
+        try {
+          gain.disconnect(pump);
+        } catch (_e) {}
+        gain.connect(duck);
+        duck.connect(pump);
+      } else if (panner) {
+        try {
+          gain.disconnect(panner);
+        } catch (_e) {}
+        gain.connect(duck);
+        duck.connect(panner);
+      } else {
+        // Tests / buffers without a panner: still own a duck node in series.
+        gain.connect(duck);
+      }
+
+      return true;
+    } catch (e) {
+      Logger.error("Failed to create sidechain gain node", e);
+      return false;
+    }
+  };
 
   hub.ensurePumpNode = function(buffer) {
       if (!buffer || !buffer._gainNode || !buffer._pannerNode) return false;
@@ -6965,24 +7486,34 @@
       if (!WebAudio._context) return false;
 
       try {
-        // Create pump gain node
         buffer._pumpGainNode = WebAudio._context.createGain();
         buffer._pumpGainNode.gain.value = 1.0;
 
-        // Insert: gainNode -> pumpGainNode -> pannerNode
-        // We disconnect gainNode (which connects to pannerNode in standard MV)
-        // and insert our node in between.
-        try {
-          buffer._gainNode.disconnect();
-        } catch (_) {
-          Logger.debugOnce(
-            "ensurePumpNode: gainNode already disconnected",
-            {},
-            "ensurePumpNode.disconnectGain"
-          );
+        const gain = buffer._gainNode;
+        const panner = buffer._pannerNode;
+        const sidechain = buffer._sidechainGainNode;
+        const pump = buffer._pumpGainNode;
+
+        // B23: disconnect only the audibility edge, not every gain output (preserves analyser taps).
+        if (sidechain) {
+          try {
+            sidechain.disconnect(panner);
+          } catch (_e) {}
+          sidechain.connect(pump);
+        } else {
+          try {
+            gain.disconnect(panner);
+          } catch (_e) {
+            Logger.debugOnce(
+              "ensurePumpNode: gainNode->panner disconnect failed",
+              {},
+              "ensurePumpNode.disconnectGainPanner"
+            );
+          }
+          gain.connect(pump);
         }
-        buffer._gainNode.connect(buffer._pumpGainNode);
-        buffer._pumpGainNode.connect(buffer._pannerNode);
+        pump.connect(panner);
+        this._reconnectSidechainAnalyserTaps(buffer);
 
         return true;
       } catch (e) {
@@ -6990,6 +7521,61 @@
         return false;
       }
     };
+
+  hub._trackDuckRestoreTimeout = function(key, timeoutId) {
+    if (!this._duckRestoreTimeouts.has(key)) {
+      this._duckRestoreTimeouts.set(key, []);
+    }
+    this._duckRestoreTimeouts.get(key).push(timeoutId);
+  };
+
+  hub._clearDuckRestoreTimeouts = function(key) {
+    const ids = this._duckRestoreTimeouts.get(key);
+    if (!ids) return;
+    ids.forEach((timeoutId) => clearTimeout(timeoutId));
+    this._duckRestoreTimeouts.delete(key);
+  };
+
+  hub._applyDuckRestore = function(key, type, trackId, restoreVolume, fadeTime, buffer, duckGen) {
+    const currentBuffer = this.tracks.get(key);
+    if (!currentBuffer || currentBuffer !== buffer) {
+      Logger.warn(`Duck restore cancelled - track ${key} no longer exists or was replaced`);
+      return;
+    }
+    if (buffer._duckGen != null && duckGen != null && buffer._duckGen !== duckGen) {
+      return;
+    }
+
+    this._clearDuckRestoreTimeouts(key);
+    buffer._duckPendingRestore = null;
+
+    if (this.pausedTracks && this.pausedTracks.has(key)) {
+      const snap = this.pausedSnapshots && this.pausedSnapshots.get(key);
+      if (snap) {
+        snap.volume = restoreVolume;
+        if (snap.originalVolume != null) snap.originalVolume = restoreVolume;
+      }
+      buffer._pausedVolume = restoreVolume;
+      buffer.volume = restoreVolume;
+      buffer._manualVolume = restoreVolume;
+      Logger.info(
+        `Duck restore applied to paused snapshot for ${key}: ${Math.round(restoreVolume * 100)}%`
+      );
+      return;
+    }
+
+    Logger.info(
+      `Starting duck restore for ${key}: -> ${Math.round(restoreVolume * 100)}% over ${fadeTime}s`
+    );
+    this.fadeAudio(
+      type,
+      trackId,
+      { volume: restoreVolume * 100, duration: fadeTime },
+      () => {
+        Logger.success(`Duck restore complete for ${key}`);
+      }
+    );
+  };
 
   hub.updatePump = function() {
       if (!this.pumpConfig.active) return;
@@ -7074,6 +7660,12 @@
           return false;
         }
 
+        // B27: dedicated duck gain on the target before the envelope loop runs.
+        if (!this.ensureSidechainGainNode(targetTrack)) {
+          Logger.warn("Sidechain setup failed: could not insert sidechain gain node on target");
+          return false;
+        }
+
         // Create analyzer for source (envelope follower)
         const context = WebAudio._context;
         const analyzer = context.createAnalyser();
@@ -7139,13 +7731,9 @@
               currentGain = targetGain + releaseCoeff * (currentGain - targetGain);
             }
 
-            // Apply gain to target track
-            if (targetTrack._gainNode) {
-              const baseVolume =
-                targetTrack.volume !== undefined && targetTrack.volume !== null
-                  ? targetTrack.volume
-                  : 0.9;
-              targetTrack._gainNode.gain.setValueAtTime(currentGain * baseVolume, now);
+            // B27: duck multiplier on dedicated sidechain gain (MV volume stays on _gainNode).
+            if (this.ensureSidechainGainNode(targetTrack)) {
+              targetTrack._sidechainGainNode.gain.setValueAtTime(currentGain, now);
             }
 
             // Continue processing if still active AND tracks still exist
@@ -7257,22 +7845,18 @@
         );
       }
 
-      // Restore target volume safely.
+      // Restore sidechain duck multiplier (MV volume untouched).
       if (restoreTarget) {
         try {
-          if (connection.targetTrack && connection.targetTrack._gainNode && WebAudio._context) {
-            const baseVolume =
-              connection.targetTrack.volume !== undefined && connection.targetTrack.volume !== null
-                ? connection.targetTrack.volume
-                : 0.9;
-            connection.targetTrack._gainNode.gain.setValueAtTime(
-              baseVolume,
+          if (connection.targetTrack && connection.targetTrack._sidechainGainNode && WebAudio._context) {
+            connection.targetTrack._sidechainGainNode.gain.setValueAtTime(
+              1.0,
               WebAudio._context.currentTime
             );
           }
         } catch (_e) {
           Logger.debugOnce(
-            "disposeSidechain: restore target volume failed",
+            "disposeSidechain: restore target sidechain gain failed",
             {},
             "disposeSidechain.restoreTarget"
           );
@@ -7354,49 +7938,33 @@
           )}% -> ${duckLevel * 100}% for ${holdTime}s`
         );
 
+        const duckGen = (buffer._duckGen || 0) + 1;
+        buffer._duckGen = duckGen;
+        buffer._duckRestoreVolume = restoreVolume;
+        buffer._duckPendingRestore = {
+          type,
+          trackId,
+          restoreVolume,
+          fadeTime,
+          duckGen,
+        };
+
+        const runRestore = () => {
+          this._applyDuckRestore(key, type, trackId, restoreVolume, fadeTime, buffer, duckGen);
+        };
+
+        // B33/B35: hold + safety restores live outside activeTimeouts (survive pause; resilient to cancelFade).
+        if (holdTime > 0) {
+          const safetyMs = Math.max(50, (fadeTime + holdTime + fadeTime + 0.05) * 1000);
+          const safetyId = setTimeout(runRestore, safetyMs);
+          this._trackDuckRestoreTimeout(key, safetyId);
+        }
+
         this.fadeAudio(type, trackId, { volume: duckLevel * 100, duration: fadeTime }, () => {
           if (holdTime > 0) {
             Logger.success(`Duck phase complete for ${key}, holding for ${holdTime}s`);
-            const timeoutId = setTimeout(() => {
-              // Check if track still exists and wasn't replaced
-              const currentBuffer = this.tracks.get(key);
-              if (!currentBuffer) {
-                Logger.warn(`Duck restore cancelled - track ${key} no longer exists`);
-                return;
-              }
-
-              if (currentBuffer !== buffer) {
-                Logger.warn(`Duck restore cancelled - track ${key} was replaced`);
-                return;
-              }
-
-              Logger.info(
-                `Starting duck restore for ${key}: ${
-                  duckLevel * 100
-                }% -> ${Math.round(restoreVolume * 100)}%`
-              );
-              this.fadeAudio(
-                type,
-                trackId,
-                { volume: restoreVolume * 100, duration: fadeTime },
-                () => {
-                  Logger.success(`Duck restore complete for ${key}`);
-                  // Remove timeout from tracking
-                  if (this.activeTimeouts.has(key)) {
-                    const timeouts = this.activeTimeouts.get(key);
-                    const index = timeouts.indexOf(timeoutId);
-                    if (index > -1) timeouts.splice(index, 1);
-                    if (timeouts.length === 0) this.activeTimeouts.delete(key);
-                  }
-                }
-              );
-            }, holdTime * 1000);
-
-            // Track this timeout for cleanup
-            if (!this.activeTimeouts.has(key)) {
-              this.activeTimeouts.set(key, []);
-            }
-            this.activeTimeouts.get(key).push(timeoutId);
+            const holdId = setTimeout(runRestore, holdTime * 1000);
+            this._trackDuckRestoreTimeout(key, holdId);
           }
         });
       }
@@ -7476,6 +8044,9 @@
           Logger.info(`Skipping sidechain exception: ${key}`);
           continue;
         }
+
+        // B32: skip paused tracks (same guard as duckAllAudio / B13).
+        if (this.pausedTracks && this.pausedTracks.has(key)) continue;
 
         const [type, trackId] = key.split("_");
         if (this.duckVolume(type, trackId, duckLevel, fadeTime, holdTime, switchId)) {
@@ -7565,6 +8136,7 @@
         tracks: opts.tracks != null ? opts.tracks : "all",
         startTime: performance.now(),
       };
+      this._startPumpRaf();
       Logger.info(
         `Started rhythmic pump: ${this.pumpConfig.bpm}bpm, ${this.pumpConfig.shape}, depth ${this.pumpConfig.depth} on ${this.pumpConfig.tracks}`
       );
@@ -7573,6 +8145,7 @@
 
   hub.stopPump = function() {
       this.pumpConfig.active = false;
+      this._stopPumpRaf();
       for (const buffer of this.tracks.values()) {
         if (buffer._pumpGainNode) {
           buffer._pumpGainNode.gain.value = 1.0;
@@ -7600,11 +8173,13 @@
     const shape = args[2] || AUDIO_CONSTANTS.DEFAULT_PUMP_SHAPE;
     const tracks = args[3] || "all";
     this.pumpConfig = { active: true, bpm, depth, shape, tracks, startTime: performance.now() };
+    this._startPumpRaf();
     Logger.info("Started rhythmic pump: " + bpm + "bpm, " + shape + ", depth " + depth + " on " + tracks);
     return true;
   });
   hub.registerHandler("stoppump", function () {
     this.pumpConfig.active = false;
+    this._stopPumpRaf();
     for (const buffer of this.tracks.values()) {
       if (buffer._pumpGainNode) buffer._pumpGainNode.gain.value = 1.0;
     }
@@ -7652,10 +8227,17 @@
   });
 
   hub.onUpdate(function () {
+    // B42: RAF drives pump in all scenes; map onUpdate is an extra tick only.
     if (this.pumpConfig && this.pumpConfig.active) this.updatePump();
   });
 
   hub.onTeardown(function (key) {
+    this._clearDuckRestoreTimeouts(key);
+    const pendingBuffer = this.tracks.get(key);
+    if (pendingBuffer) {
+      pendingBuffer._duckPendingRestore = null;
+      delete pendingBuffer._duckRestoreVolume;
+    }
     if (key.startsWith("bgm_") && this.sidechainConnections) {
       const trackId = key.substring(4);
       for (const [connKey, conn] of Array.from(this.sidechainConnections.entries())) {
@@ -7667,6 +8249,12 @@
       }
     }
     const buffer = this.tracks.get(key);
+    if (buffer && buffer._sidechainGainNode) {
+      try {
+        buffer._sidechainGainNode.disconnect();
+      } catch (_e) {}
+      buffer._sidechainGainNode = null;
+    }
     if (buffer && buffer._pumpGainNode) {
       try {
         buffer._pumpGainNode.disconnect();
@@ -7752,6 +8340,7 @@
   hub.onRestoreGlobalState(function (meta) {
     if (!meta || !meta.pump || !meta.pump.active) {
       if (this.pumpConfig) this.pumpConfig.active = false;
+      this._stopPumpRaf();
       return;
     }
     const p = meta.pump;
@@ -7764,6 +8353,7 @@
       // Reset phase so restore doesn't jump mid-cycle from a stale startTime.
       startTime: typeof performance !== "undefined" && performance.now ? performance.now() : Date.now(),
     };
+    this._startPumpRaf();
     Logger.info(
       "Restored rhythmic pump: " +
         this.pumpConfig.bpm +
@@ -7775,6 +8365,34 @@
         this.pumpConfig.tracks
     );
   });
+
+  if (!hub._dynamicsResumeWrapped) {
+    hub._dynamicsResumeWrapped = true;
+    const origResume = hub.resumeAudio;
+    hub.resumeAudio = function(type, trackId, args) {
+      const key = `${type}_${trackId}`;
+      const pendingBefore = this.tracks.get(key) && this.tracks.get(key)._duckPendingRestore;
+      const result = origResume.apply(this, arguments);
+      const buffer = this.tracks.get(key);
+      if (
+        buffer &&
+        pendingBefore &&
+        buffer._duckPendingRestore &&
+        !(this.pausedTracks && this.pausedTracks.has(key))
+      ) {
+        const snap = this.pausedSnapshots && this.pausedSnapshots.get(key);
+        if (
+          snap &&
+          pendingBefore.restoreVolume != null &&
+          Math.abs(snap.volume - pendingBefore.restoreVolume) < 1e-6
+        ) {
+          buffer.volume = pendingBefore.restoreVolume;
+          buffer._manualVolume = pendingBefore.restoreVolume;
+        }
+      }
+      return result;
+    };
+  }
 
   Logger.success(TAG + " loaded — duck / pump / sidechain / pitchbendall ready");
 })();
@@ -7905,6 +8523,243 @@
     commandBuffer: new Map(),
     activeCommands: new Map(),
     restoreCommands: new Map(),
+    // Pre-command snapshots for reversing non-play switch actions (B24).
+    _preCommandState: new Map(),
+
+    _trackKey(command) {
+      if (!command) return "";
+      const type = command.type != null ? String(command.type) : "";
+      const trackId = command.trackId != null ? String(command.trackId) : "";
+      return type && trackId ? `${type}_${trackId}` : "";
+    },
+
+    _capturePreCommandState(command) {
+      const key = this._trackKey(command);
+      const state = { trackKey: key };
+      const buffer = key && hub.tracks ? hub.tracks.get(key) : null;
+
+      if (buffer) {
+        state.volume =
+          buffer._manualVolume != null ? buffer._manualVolume : buffer.volume;
+        state.pan = buffer.pan != null ? buffer.pan : 0;
+        state.pitchBase =
+          buffer._basePitch != null
+            ? buffer._basePitch
+            : buffer.pitch != null
+              ? buffer.pitch
+              : 1;
+        state.effect = buffer._effect != null ? buffer._effect : null;
+      }
+
+      if (key && hub.proximityData && hub.proximityData.has(key)) {
+        state.hadProximity = true;
+      }
+      if (key && hub.panSweeps && hub.panSweeps.has(key)) {
+        state.hadPanSweep = true;
+      }
+
+      return state;
+    },
+
+    _restoreMixerState(command, preState) {
+      if (!preState) return false;
+      const opts = { duration: 0 };
+      if (preState.volume != null) opts.volume = preState.volume * 100;
+      if (preState.pan != null) opts.pan = preState.pan;
+      if (preState.pitchBase != null) opts.pitch = preState.pitchBase * 100;
+      try {
+        return hub.fadeAudio(command.type, command.trackId, opts);
+      } catch (error) {
+        Logger.error(`Error restoring mixer for switch command:`, error);
+        return false;
+      }
+    },
+
+    _restoreEffectState(command, preState) {
+      if (!preState) return false;
+      const key = preState.trackKey || this._trackKey(command);
+      if (!key) return false;
+      try {
+        if (preState.effect && typeof hub.applyEffect === "function") {
+          return hub.applyEffect(key, preState.effect);
+        }
+        if (typeof hub.clearEffect === "function") {
+          return hub.clearEffect(key, { keepConfig: false });
+        }
+      } catch (error) {
+        Logger.error(`Error restoring effect for switch command:`, error);
+      }
+      return false;
+    },
+
+    _reverseSpatialState(command, preState) {
+      let reversed = false;
+      const { type, trackId } = command;
+      if (preState && preState.hadProximity && typeof hub.clearProximity === "function") {
+        try {
+          hub.clearProximity(type, trackId);
+          reversed = true;
+        } catch (error) {
+          Logger.error(`Error clearing proximity for switch command:`, error);
+        }
+      }
+      if (preState && preState.hadPanSweep && typeof hub.stopPanSweep === "function") {
+        try {
+          hub.stopPanSweep(type, trackId);
+          reversed = true;
+        } catch (error) {
+          Logger.error(`Error stopping pan sweep for switch command:`, error);
+        }
+      }
+      return reversed;
+    },
+
+    _reverseSwitchCommand(command, preState) {
+      const action = command && command.action != null ? String(command.action) : "";
+
+      switch (action) {
+        case "play":
+          try {
+            hub.stopAudio(command.type, command.trackId, 0);
+            return true;
+          } catch (error) {
+            Logger.error(`Error stopping audio for switch command:`, error);
+            return false;
+          }
+
+        case "duck":
+          // Restore commands run after the active list is cleared.
+          return false;
+
+        case "fade":
+        case "pitch":
+        case "pan":
+          return this._restoreMixerState(command, preState);
+
+        case "effect":
+        case "fadeeffect":
+        case "fadeouteffect":
+        case "cleareffect":
+        case "crossfadeeffect":
+          return this._restoreEffectState(command, preState);
+
+        case "proximity":
+        case "doppler":
+          if (typeof hub.clearProximity === "function") {
+            try {
+              hub.clearProximity(command.type, command.trackId);
+              return true;
+            } catch (error) {
+              Logger.error(`Error clearing proximity for switch command:`, error);
+            }
+          }
+          return false;
+
+        case "pansweep":
+          if (typeof hub.stopPanSweep === "function") {
+            try {
+              hub.stopPanSweep(command.type, command.trackId);
+              return true;
+            } catch (error) {
+              Logger.error(`Error stopping pan sweep for switch command:`, error);
+            }
+          }
+          return false;
+
+        default: {
+          let reversed = false;
+          if (preState) {
+            if (this._restoreMixerState(command, preState)) reversed = true;
+            if (this._restoreEffectState(command, preState)) reversed = true;
+            if (this._reverseSpatialState(command, preState)) reversed = true;
+          }
+          return reversed;
+        }
+      }
+    },
+
+    _serializeMapOfArrays(map) {
+      const out = {};
+      for (const [switchId, list] of map.entries()) {
+        out[String(switchId)] = Array.isArray(list) ? list : [];
+      }
+      return out;
+    },
+
+    _deserializeMapOfArrays(obj) {
+      const map = new Map();
+      if (!obj || typeof obj !== "object") return map;
+      for (const [switchId, list] of Object.entries(obj)) {
+        map.set(Number(switchId), Array.isArray(list) ? list : []);
+      }
+      return map;
+    },
+
+    _serializePreCommandState() {
+      const out = {};
+      for (const [commandId, state] of this._preCommandState.entries()) {
+        out[String(commandId)] = state;
+      }
+      return out;
+    },
+
+    _deserializePreCommandState(obj) {
+      this._preCommandState.clear();
+      if (!obj || typeof obj !== "object") return;
+      for (const [commandId, state] of Object.entries(obj)) {
+        this._preCommandState.set(Number(commandId), state);
+      }
+    },
+
+    _captureForSave() {
+      if (
+        !this.commandBuffer.size &&
+        !this.activeCommands.size &&
+        !this.restoreCommands.size &&
+        !this._preCommandState.size &&
+        !SwitchManager.monitoredSwitches.size
+      ) {
+        return null;
+      }
+
+      return {
+        commandBuffer: this._serializeMapOfArrays(this.commandBuffer),
+        activeCommands: this._serializeMapOfArrays(this.activeCommands),
+        restoreCommands: this._serializeMapOfArrays(this.restoreCommands),
+        preCommandState: this._serializePreCommandState(),
+        monitoredSwitches: SwitchManager.getMonitoredSwitches(),
+      };
+    },
+
+    _restoreFromSave(data) {
+      this.commandBuffer.clear();
+      this.activeCommands.clear();
+      this.restoreCommands.clear();
+      this._preCommandState.clear();
+      SwitchManager.clearAll();
+
+      if (!data || typeof data !== "object") return;
+
+      this.commandBuffer = this._deserializeMapOfArrays(data.commandBuffer);
+      this.activeCommands = this._deserializeMapOfArrays(data.activeCommands);
+      this.restoreCommands = this._deserializeMapOfArrays(data.restoreCommands);
+      this._deserializePreCommandState(data.preCommandState);
+
+      const monitored = Array.isArray(data.monitoredSwitches) ? data.monitoredSwitches : [];
+      for (let i = 0; i < monitored.length; i++) {
+        SwitchManager.addSwitch(monitored[i]);
+      }
+      for (const switchId of this.commandBuffer.keys()) {
+        SwitchManager.addSwitch(switchId);
+      }
+      for (const switchId of this.restoreCommands.keys()) {
+        SwitchManager.addSwitch(switchId);
+      }
+
+      Logger.switch(
+        `Restored switch buffer (${this.commandBuffer.size} switches, ${SwitchManager.monitoredSwitches.size} monitored)`
+      );
+    },
 
     _makeCommandKey(command) {
       if (!command) return "||";
@@ -7985,7 +8840,10 @@
         for (let i = lastIndex - 1; i >= 0; i--) {
           if (this._makeCommandKey(list[i]) === commandKey) {
             const removed = list.splice(i, 1)[0];
-            if (removed && removed.id) this._removeActiveId(switchId, removed.id);
+            if (removed && removed.id) {
+              this._removeActiveId(switchId, removed.id);
+              this._preCommandState.delete(removed.id);
+            }
             lastIndex -= 1;
           }
         }
@@ -8011,7 +8869,10 @@
         command._fugsSwitchSig = signature;
         list[lastIndex] = command;
 
-        if (oldId) this._removeActiveId(switchId, oldId);
+        if (oldId) {
+          this._removeActiveId(switchId, oldId);
+          this._preCommandState.delete(oldId);
+        }
         Logger.switch(`Updated buffered command for switch ${switchId}`, {
           oldCommandId: oldId,
           commandId: newId,
@@ -8134,10 +8995,17 @@
             trackId: command.trackId,
           });
 
+          const action = command.action != null ? String(command.action) : "";
+          if (action !== "duck") {
+            this._preCommandState.set(command.id, this._capturePreCommandState(command));
+          }
+
           const result = hub.executeCommand(command);
           if (result) {
             activeList.push(command.id);
             executedCount++;
+          } else if (action !== "duck") {
+            this._preCommandState.delete(command.id);
           }
         } catch (error) {
           Logger.error(`Error executing switch command for switch ${switchId}:`, error);
@@ -8155,27 +9023,22 @@
       const commands = this.commandBuffer.get(switchId);
       const activeList = this.activeCommands.get(switchId);
 
-      // Actually stop the audio tracks that were started by switch commands
+      // Reverse every executed switch command (B24).
       if (commands && activeList && activeList.length > 0) {
-        let stoppedCount = 0;
+        let reversedCount = 0;
 
         commands.forEach((command) => {
-          // Only stop if this command was executed (its ID is in activeList)
-          if (activeList.includes(command.id)) {
-            // Only stop "play" commands, not fades/ducks/etc
-            if (command.action === "play") {
-              try {
-                hub.stopAudio(command.type, command.trackId, 0);
-                stoppedCount++;
-              } catch (error) {
-                Logger.error(`Error stopping audio for switch ${switchId}:`, error);
-              }
-            }
+          if (!activeList.includes(command.id)) return;
+
+          const preState = this._preCommandState.get(command.id);
+          if (this._reverseSwitchCommand(command, preState)) {
+            reversedCount++;
           }
+          this._preCommandState.delete(command.id);
         });
 
-        if (stoppedCount > 0) {
-          Logger.success(`Stopped ${stoppedCount} audio tracks for switch ${switchId}`);
+        if (reversedCount > 0) {
+          Logger.success(`Reversed ${reversedCount} switch commands for switch ${switchId}`);
         }
       }
 
@@ -8210,9 +9073,19 @@
       }
     },
 
+    _clearPreStateForSwitch(switchId) {
+      const commands = this.commandBuffer.get(switchId);
+      if (!commands) return;
+      for (let i = 0; i < commands.length; i++) {
+        const cmd = commands[i];
+        if (cmd && cmd.id) this._preCommandState.delete(cmd.id);
+      }
+    },
+
     clearSwitch(switchId) {
       const hadCommands = this.commandBuffer.has(switchId);
 
+      this._clearPreStateForSwitch(switchId);
       this.commandBuffer.delete(switchId);
       this.activeCommands.delete(switchId);
       this.restoreCommands.delete(switchId);
@@ -8229,6 +9102,7 @@
       this.commandBuffer.clear();
       this.activeCommands.clear();
       this.restoreCommands.clear();
+      this._preCommandState.clear();
 
       // Clear all monitored switches
       for (const switchId of SwitchManager.getMonitoredSwitches()) {
@@ -8254,6 +9128,18 @@
       SwitchBuffer.executeSwitch(switchId, true);
     }
     return true;
+  });
+
+  // B21: persist SwitchBuffer + monitored switches in __fugsMeta (same pattern as pump).
+  hub.onCaptureGlobalState(function () {
+    const snap = SwitchBuffer._captureForSave();
+    if (!snap) return undefined;
+    return { switchBuffer: snap };
+  });
+
+  hub.onRestoreGlobalState(function (meta) {
+    if (!meta || !meta.switchBuffer) return;
+    SwitchBuffer._restoreFromSave(meta.switchBuffer);
   });
 
   SwitchManager.init();
@@ -8328,9 +9214,9 @@
         return false;
       }
 
-      // Cooldown check
-      if (config.cooldown > 0) {
-        const lastPlayed = this.aliasLastPlayed.get(aliasName) || 0;
+      // Cooldown check — missing entry means never played (B43)
+      if (config.cooldown > 0 && this.aliasLastPlayed.has(aliasName)) {
+        const lastPlayed = this.aliasLastPlayed.get(aliasName);
         const now = performance.now();
         if (now - lastPlayed < config.cooldown) {
           Logger.info(
@@ -8338,7 +9224,6 @@
           );
           return false;
         }
-        this.aliasLastPlayed.set(aliasName, now);
       }
 
       // Pick random sound from pool
@@ -8365,7 +9250,7 @@
         pan: Math.round(finalPan),
       });
 
-      return this.playAudio({
+      const played = this.playAudio({
         type,
         trackId,
         name: soundName,
@@ -8376,6 +9261,13 @@
         persistence: "none",
         pauseMode: "never",
       });
+
+      // Consume cooldown only after a successful play (B41)
+      if (config.cooldown > 0 && played) {
+        this.aliasLastPlayed.set(aliasName, performance.now());
+      }
+
+      return played;
     };
 
   hub.listAliases = function() {
@@ -8464,6 +9356,27 @@
 
   hub.registerHandler("listaliases", function () {
     return this.listAliases();
+  });
+
+  // Persist alias configs (not cooldowns) across save/load via __fugsMeta (B22).
+  hub.onCaptureGlobalState(function () {
+    if (!this.sfxAliases || this.sfxAliases.size === 0) return undefined;
+    return { sfxAliases: Object.fromEntries(this.sfxAliases) };
+  });
+
+  hub.onRestoreGlobalState(function (meta) {
+    if (!meta || !meta.sfxAliases || typeof meta.sfxAliases !== "object") return;
+    if (!this.sfxAliases) this.sfxAliases = new Map();
+    this.sfxAliases.clear();
+    if (this.aliasLastPlayed) this.aliasLastPlayed.clear();
+    for (const [name, config] of Object.entries(meta.sfxAliases)) {
+      if (config && Array.isArray(config.pool) && config.pool.length > 0) {
+        this.sfxAliases.set(name, config);
+      }
+    }
+    if (this.sfxAliases.size > 0) {
+      Logger.info(`Restored ${this.sfxAliases.size} SFX alias(es) from save`);
+    }
   });
 
   Logger.success(TAG + " loaded — SFX aliases ready");

@@ -160,13 +160,18 @@
           let node;
 
           switch (effect.type) {
-            case "reverb":
-              node = this.context.createConvolver();
-              node.buffer = this.createReverbBuffer(
+            case "reverb": {
+              const reverbNode = this.context.createConvolver();
+              reverbNode.buffer = this.createReverbBuffer(
                 effect.duration || AUDIO_CONSTANTS.DEFAULT_REVERB_DURATION,
                 effect.decay || AUDIO_CONSTANTS.DEFAULT_REVERB_DECAY
               );
+              currentNode.connect(reverbNode);
+              reverbNode.connect(chain.wetGain);
+              chain.nodes.push(reverbNode);
+              node = null; // Parallel send — inserts stay on the main path
               break;
+            }
 
             case "lowpass":
               node = this.context.createBiquadFilter();
@@ -257,8 +262,10 @@
               break;
 
             case "delay": {
-              node = this.context.createDelay(effect.maxDelay || AUDIO_CONSTANTS.DEFAULT_DELAY_MAX);
-              node.delayTime.value = effect.delay || AUDIO_CONSTANTS.DEFAULT_DELAY_TIME;
+              const delayTime = effect.delay || AUDIO_CONSTANTS.DEFAULT_DELAY_TIME;
+              const maxDelay = effect.maxDelay || AUDIO_CONSTANTS.DEFAULT_DELAY_MAX;
+              node = this.context.createDelay(Math.max(maxDelay, delayTime, 1));
+              node.delayTime.value = delayTime;
               const delayFeedback = this.context.createGain();
               delayFeedback.gain.value = effect.feedback || AUDIO_CONSTANTS.DEFAULT_FEEDBACK;
               const delayWet = this.context.createGain();
@@ -315,9 +322,10 @@
                 const maxDelay = effect.maxDelay || 1;
 
                 taps.forEach((tap) => {
-                  const tapDelay = this.context.createDelay(maxDelay);
-                  tapDelay.delayTime.value =
+                  const tapDelayTime =
                     tap.delay || AUDIO_CONSTANTS.MULTITAP_TAP_DELAY_FALLBACK;
+                  const tapDelay = this.context.createDelay(Math.max(maxDelay, tapDelayTime, 1));
+                  tapDelay.delayTime.value = tapDelayTime;
 
                   const tapFeedback = this.context.createGain();
                   tapFeedback.gain.value =
@@ -646,13 +654,10 @@
           }
         });
 
-        // Connect wet/dry paths
-        chain.input.connect(chain.dryGain);
+        // B37: inserts ride the main path into dryGain; send effects tap wetGain.
+        // Never wire input→dryGain directly — that bypassed insert filters.
+        currentNode.connect(chain.dryGain);
         chain.dryGain.connect(chain.output);
-
-        if (currentNode !== chain.input) {
-          currentNode.connect(chain.wetGain);
-        }
         chain.wetGain.connect(chain.output);
 
         return chain;
@@ -1388,6 +1393,76 @@
   };
 
   // --- Track-level effect integration (lives on hub) ---
+  // Send effects tap the wet bus; everything else is 100% in-series on the main path.
+  const SEND_EFFECT_TYPES = {
+    reverb: true,
+    delay: true,
+    chorus: true,
+    multitap: true,
+  };
+
+  hub._clearEffectCrossfadeTimeouts = function(key) {
+    if (!this._effectCrossfadeTimeouts || !this._effectCrossfadeTimeouts.has(key)) return;
+    const timeouts = this._effectCrossfadeTimeouts.get(key);
+    timeouts.forEach((timeoutId) => clearTimeout(timeoutId));
+    this._effectCrossfadeTimeouts.delete(key);
+  };
+
+  hub._trackEffectCrossfadeTimeout = function(key, timeoutId) {
+    if (!this._effectCrossfadeTimeouts) this._effectCrossfadeTimeouts = new Map();
+    if (!this._effectCrossfadeTimeouts.has(key)) {
+      this._effectCrossfadeTimeouts.set(key, []);
+    }
+    this._effectCrossfadeTimeouts.get(key).push(timeoutId);
+  };
+
+  hub._untrackEffectCrossfadeTimeout = function(key, timeoutId) {
+    if (!this._effectCrossfadeTimeouts || !this._effectCrossfadeTimeouts.has(key)) return;
+    const timeouts = this._effectCrossfadeTimeouts.get(key);
+    const index = timeouts.indexOf(timeoutId);
+    if (index > -1) timeouts.splice(index, 1);
+    if (timeouts.length === 0) this._effectCrossfadeTimeouts.delete(key);
+  };
+
+  hub._tryConnectEffectChain = function(key, buffer) {
+    if (!this.effectChains.has(key) || !buffer) {
+      return { connected: false, queued: false };
+    }
+
+    if (this.connectEffectChain(key, buffer)) {
+      return { connected: true, queued: false };
+    }
+
+    const validation = AudioEffects.validateBuffer(buffer, key);
+    if (
+      validation.valid ||
+      !validation.reason ||
+      validation.reason.indexOf("_sourceNode") === -1
+    ) {
+      return { connected: false, queued: false };
+    }
+
+    if (typeof buffer.addLoadListener !== "function") {
+      return { connected: false, queued: false };
+    }
+
+    if (!this._effectConnectGen) this._effectConnectGen = new Map();
+    const connectGen = (this._effectConnectGen.get(key) || 0) + 1;
+    this._effectConnectGen.set(key, connectGen);
+
+    const self = this;
+    buffer.addLoadListener(function onEffectBufferReady() {
+      if (self._effectConnectGen.get(key) !== connectGen) return;
+      if (!self.effectChains.has(key)) return;
+      const currentBuffer = self.tracks.get(key);
+      if (!currentBuffer) return;
+      self.connectEffectChain(key, currentBuffer);
+    });
+
+    Logger.effect(`Queued effect-chain connect for ${key} until buffer is ready`);
+    return { connected: false, queued: true };
+  };
+
   hub.connectEffectChain = function(key, buffer) {
       const chain = this.effectChains.get(key);
       if (!chain) return false;
@@ -1610,6 +1685,11 @@
       // this key, so bump the generation token to abort its mid-point timeout.
       if (!this._effectCrossfadeGen) this._effectCrossfadeGen = new Map();
       this._effectCrossfadeGen.set(key, (this._effectCrossfadeGen.get(key) || 0) + 1);
+      this._clearEffectCrossfadeTimeouts(key);
+
+      // Supersede any pending cold-buffer connect retry for this key.
+      if (!this._effectConnectGen) this._effectConnectGen = new Map();
+      this._effectConnectGen.set(key, (this._effectConnectGen.get(key) || 0) + 1);
 
       // Clean up existing effect chain if present
       if (this.effectChains.has(key)) {
@@ -1707,18 +1787,24 @@
         effects = [effect];
       }
 
-      // Determine wet/dry mix from effect metadata (optional)
+      // Determine wet/dry mix from effect metadata (optional).
+      // B37: insert-only chains stay 100% on the main path (wetMix 0).
       const clamp01 = (v) => Math.max(0, Math.min(1, v));
-      let wetMix = 0.35; // sensible default
+      const hasSendEffect = effects.some(
+        (e) => e && typeof e === "object" && SEND_EFFECT_TYPES[e.type]
+      );
+      let wetMix = hasSendEffect ? 0.35 : 0;
 
-      // Priority: explicit wetMix on any effect, else first numeric "wet"
-      const mixSource = effects.find((e) => e && typeof e === "object" && e.wetMix !== undefined);
-      if (mixSource && typeof mixSource.wetMix === "number" && !isNaN(mixSource.wetMix)) {
-        wetMix = mixSource.wetMix;
-      } else {
-        const wetSource = effects.find((e) => e && typeof e === "object" && e.wet !== undefined);
-        if (wetSource && typeof wetSource.wet === "number" && !isNaN(wetSource.wet)) {
-          wetMix = wetSource.wet;
+      if (hasSendEffect) {
+        // Priority: explicit wetMix on any effect, else first numeric "wet"
+        const mixSource = effects.find((e) => e && typeof e === "object" && e.wetMix !== undefined);
+        if (mixSource && typeof mixSource.wetMix === "number" && !isNaN(mixSource.wetMix)) {
+          wetMix = mixSource.wetMix;
+        } else {
+          const wetSource = effects.find((e) => e && typeof e === "object" && e.wet !== undefined);
+          if (wetSource && typeof wetSource.wet === "number" && !isNaN(wetSource.wet)) {
+            wetMix = wetSource.wet;
+          }
         }
       }
       wetMix = clamp01(wetMix);
@@ -1731,8 +1817,6 @@
 
         const buffer = this.tracks.get(key);
         if (buffer) {
-          this.connectEffectChain(key, buffer);
-          // Persist the chosen effect on the buffer so save/resume/listall stay accurate.
           const effectKeyToStore =
             typeof effectConfig === "string"
               ? effectConfig
@@ -1744,6 +1828,14 @@
           if (this.pausedSnapshots && this.pausedSnapshots.has(key)) {
             const snap = this.pausedSnapshots.get(key);
             if (snap) snap.effect = effectKeyToStore;
+          }
+
+          const connectResult = this._tryConnectEffectChain(key, buffer);
+          if (!connectResult.connected && !connectResult.queued) {
+            Logger.warn(`Failed to connect effect chain for ${key}`);
+            this._disposeEffectChain(key, chain, buffer);
+            this.effectChains.delete(key);
+            return false;
           }
         }
 
@@ -1864,6 +1956,7 @@
       if (!this._effectCrossfadeGen) this._effectCrossfadeGen = new Map();
       const gen = (this._effectCrossfadeGen.get(key) || 0) + 1;
       this._effectCrossfadeGen.set(key, gen);
+      this._clearEffectCrossfadeTimeouts(key);
 
       // Start fade out of old effect
       this.fadeOutEffect(key, duration / 2);
@@ -1874,18 +1967,14 @@
           // B10: bail if a newer crossfade/effect superseded this one.
           if (this._effectCrossfadeGen.get(key) !== gen) {
             Logger.info(`Effect cross-fade for ${key} superseded — skipping new effect apply`);
-            if (this.activeTimeouts.has(key)) {
-              const timeouts = this.activeTimeouts.get(key);
-              const idx = timeouts.indexOf(timeoutId);
-              if (idx > -1) timeouts.splice(idx, 1);
-              if (timeouts.length === 0) this.activeTimeouts.delete(key);
-            }
+            this._untrackEffectCrossfadeTimeout(key, timeoutId);
             return;
           }
 
           // Check if track still exists before applying new effect
           if (!this.tracks.has(key)) {
             Logger.warn(`Effect cross-fade cancelled - track ${key} no longer exists`);
+            this._untrackEffectCrossfadeTimeout(key, timeoutId);
             return;
           }
 
@@ -1895,22 +1984,14 @@
           this.fadeEffect(key, newEffect, newEffectParams, duration / 2);
           Logger.success(`Effect cross-fade complete for ${key}: ${oldEffect} -> ${newEffect}`);
 
-          // Remove timeout from tracking
-          if (this.activeTimeouts.has(key)) {
-            const timeouts = this.activeTimeouts.get(key);
-            const index = timeouts.indexOf(timeoutId);
-            if (index > -1) timeouts.splice(index, 1);
-            if (timeouts.length === 0) this.activeTimeouts.delete(key);
-          }
+          this._untrackEffectCrossfadeTimeout(key, timeoutId);
         },
         (duration / 2) * 1000
       );
 
-      // Track this timeout for cleanup
-      if (!this.activeTimeouts.has(key)) {
-        this.activeTimeouts.set(key, []);
-      }
-      this.activeTimeouts.get(key).push(timeoutId);
+      // B38-adjacent: keep crossfade midpoint timers off hub.activeTimeouts so
+      // core pause/stop does not cancel the pending apply.
+      this._trackEffectCrossfadeTimeout(key, timeoutId);
 
       return true;
   };
@@ -2049,6 +2130,12 @@
   hub.onTeardown(function (key) {
     const chain = this.effectChains && this.effectChains.get(key);
     if (!chain) return;
+    if (typeof this._clearEffectCrossfadeTimeouts === "function") {
+      this._clearEffectCrossfadeTimeouts(key);
+    }
+    if (this._effectConnectGen) {
+      this._effectConnectGen.set(key, (this._effectConnectGen.get(key) || 0) + 1);
+    }
     if (typeof this._disposeEffectChain === "function") {
       this._disposeEffectChain(key, chain, this.tracks.get(key), { restoreRouting: false });
     }
