@@ -225,10 +225,25 @@ async function createEnv(opts) {
     },
     addEventListener() {},
     removeEventListener() {},
+    hasFocus: () => true,
   };
 
   const userAgent = opts.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36";
+  // Wall-clock reads (Date.now / new Date()) follow the virtual clock too, so code that measures
+  // elapsed time with Date (the dev test runner's wait()) behaves under fast-forwarded tests.
+  const DATE_EPOCH = Date.UTC(2026, 0, 1);
+  class VirtualDate extends Date {
+    constructor(...args) {
+      if (args.length === 0) super(DATE_EPOCH + clock.api.performance.now());
+      else super(...args);
+    }
+    static now() {
+      return DATE_EPOCH + clock.api.performance.now();
+    }
+  }
+
   const sandbox = {
+    Date: VirtualDate,
     console: consoleSpy,
     setTimeout: clock.api.setTimeout,
     clearTimeout: clock.api.clearTimeout,

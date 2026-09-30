@@ -1,12 +1,14 @@
 # FugsMultiTrackAudioEX — Known Bugs
 
 **Source:** `FugsMultiTrackAudioEX.js`  
-**Last updated:** 2026-08-09  
+**Last updated:** 2026-09-30  
 **Status legend:** Open · Fixed · Confirmed in code · Fix not applied
 
 This file tracks confirmed defects found by code review. Severity reflects user impact under default or common setups.
 
 > **Status (2026-08-09):** All 16 confirmed bugs (B01–B16) are fixed. Each was verified with isolated Node smoke tests simulating the RPG Maker MV audio environment. Fixes span the core (`FugsMultiTrackAudioEX.js`) and the `FugsAudio2Effects` / `FugsAudio3Spatial` / `FugsAudio4Dynamics` satellites.
+
+> **Status (2026-09-30, v2.3):** A compatibility audit against engine models (MV 1.6, MZ 1.x) and the real MZ 1.7.0 scripts found 18 further defects (B17–B34): 6 that made the pack unusable or badly broken on **MZ** (before the fixes only 10 of 137 scenarios passed there), and 12 that hit **MV** (and MZ) — the original code passed 113 of 131 on the MV model. All are fixed and covered by the scenarios in `scripts/tests/` (see [README → Verification](../README.md#verification)). The earlier smoke tests could not see them: their `AudioManager`/`WebAudio` stubs ignored the folder argument, had no source nodes, and made `isPlaying()` synchronous.
 
 ---
 
@@ -30,6 +32,24 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 | B14 | Medium | Proximity gated on tile coords, not smooth movement | **Fixed** |
 | B15 | Low–Medium | Manual resume doesn’t refresh proximity volume | **Fixed** |
 | B16 | Low | Pause-with-fadeout blocks resume until timeout | **Fixed** |
+| B17 | Critical | MZ: nothing plays (wrong audio URL) | **Fixed** |
+| B18 | Critical | MZ: effects never connect; every pitch change restarts the track | **Fixed** |
+| B19 | Critical | MZ: no plugin commands exist | **Fixed** |
+| B20 | High | MZ: save restore runs before the save is loaded | **Fixed** |
+| B21 | High | MZ (web): progressive decode replaces source nodes — routing lost, one-shots cut short | **Fixed** |
+| B22 | Medium | MZ: released buffers stay in memory (`destroy()` never called) | **Fixed** |
+| B23 | High | Tracks auto-paused for battle vanish on return | **Fixed** |
+| B24 | High | `seek()` drifts after pitch changes; low-pitched one-shots cut short | **Fixed** |
+| B25 | High | Effects requested while the file is still loading are never connected | **Fixed** |
+| B26 | Medium | `(pause:scene)` never resumes; `pauseall-<type>` / `resumeall-<type>` ignore the type | **Fixed** |
+| B27 | Medium | Missing / mistyped audio file leaves a zombie track; `play` without a name requests `undefined` | **Fixed** |
+| B28 | Medium | `sidechain` by file name (as documented) does not resolve | **Fixed** |
+| B29 | Medium | Pump node orphaned when a track restarts; no-arg `disconnect()` cuts sidechain taps | **Fixed** |
+| B30 | Low | Effects log a false `console.error` on every boot | **Fixed** |
+| B31 | Medium | MV on Android Chrome: BGM tracks go through the shared `Html5Audio` element | **Fixed** |
+| B32 | High | Returning from a battle is treated as a map change | **Fixed** |
+| B33 | Low | Alias `cooldown` swallows the first play shortly after startup | **Fixed** |
+| B34 | Low | Core parameters ignored when the Core is renamed or the bundle is used under its own name | **Fixed** |
 
 ---
 
@@ -217,6 +237,244 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 
 ---
 
+---
+
+## Compatibility audit (v2.3) — MZ and MV
+
+Found with the engine harness (`scripts/harness`, scenarios in `scripts/tests`). Everything version-specific now lives in one place, `FugsAudio.engine` in the Core (`createBuffer`, `sourceNodes`, `setPlaybackRate`, `routeSources`, `release`, …), so the satellites stay engine-agnostic.
+
+### MZ
+
+#### B17 — Critical: MZ — nothing plays — **FIXED 2026-09-30**
+
+**Where:** every `AudioManager.createBuffer(type, name)` call (`playAudio`, `syncPlay`, `resumeAudio`)
+
+**What was wrong:** MZ's `createBuffer` takes the folder **with a trailing slash** (`"bgm/"`); MV takes `"bgm"`. On MZ the URL became `audio/bgmThemeA.ogg`, so every file failed to load.
+
+**Fix:** `Engine.createBuffer(type, name)` picks the right folder form for the running engine.
+
+**Covered by:** `01-boot-and-commands` (every audio type maps to its own folder, …)
+
+---
+
+#### B18 — Critical: MZ — effects never connect; every pitch change restarts the track — **FIXED 2026-09-30**
+
+**Where:** `FugsAudio2Effects.js` (`validateBuffer`, `connectEffectChain`, `_disposeEffectChain`), `updateTrackPitch`
+
+**What was wrong:** The plugin worked on `buffer._sourceNode`. MZ keeps `buffer._sourceNodes[]` (one node per decoded chunk), so effect chains found nothing to route. `updateTrackPitch` then fell back to the engine's `pitch` setter — which **restarts playback from 0** (MV and MZ) — so on MZ every pitch fade, doppler update and `pitchbend` step re-triggered the song.
+
+**Fix:** `Engine.sourceNodes(buffer)` returns the live nodes on either engine; effects route/restore all of them. `Engine.setPlaybackRate(buffer, rate)` ramps `playbackRate` on every node, re-anchors the buffer's start time so `seek()` stays exact, and never touches the `pitch` setter.
+
+**Covered by:** `02-playback` (pitch keeps position), `04-effects`, `05-spatial-and-dynamics`
+
+---
+
+#### B19 — Critical: MZ — no plugin commands exist — **FIXED 2026-09-30**
+
+**Where:** `Game_Interpreter.prototype.pluginCommand` hook, plugin header
+
+**What was wrong:** MZ only offers commands a plugin declares with `@command`; the pack declared none, and MZ's legacy path (`command356`) passes its parameters as an argument (there is no `this._params`), which broke the quoted-name re-parse for imported MV events.
+
+**Fix:** Header declares `@command run` (one command) and `@command runMultiple` (one per line); both are registered under the file name the plugin was **actually loaded as** (users rename plugins) plus the default names. `command356` is wrapped so imported "Plugin Command (MV)" events keep their quoted names. New script call `FugsAudio.runCommandText(text)`.
+
+**Covered by:** `01-boot-and-commands` (native `run`, quoted names, renamed plugin file, switch-gated, legacy MV events)
+
+---
+
+#### B20 — High: MZ — save restore runs before the save is loaded — **FIXED 2026-09-30**
+
+**Where:** `DataManager.loadGame` hook
+
+**What was wrong:** In MZ `loadGame` returns a **Promise**; the hook treated the return value as MV's boolean and restored audio on a fixed 100 ms timer — before the save contents had been extracted, so it could apply the wrong audio state or none.
+
+**Fix:** When `loadGame` returns a Promise, the scene transition and `loadAllStates("auto")` run after it resolves; MV's synchronous path is unchanged.
+
+**Covered by:** `03-scenes-and-saves` (slow disk, save/load restores the mix and position)
+
+---
+
+#### B21 — High: MZ web builds — progressive decode replaces the source nodes — **FIXED 2026-09-30**
+
+**Where:** effect routing, `_scheduleTrackEndAction`
+
+**What was wrong:** Served over http(s), MZ downloads a file in chunks and re-decodes the growing data, **re-creating the source nodes each time**. Effect-chain routing was silently lost with the first refresh, and an end-of-track timer computed from the first *partial* decode cut one-shots short.
+
+**Fix:** `Engine.routeSources` hooks node creation so routing survives refreshes; the end timer re-arms itself while the buffer is still playing with time left.
+
+**Covered by:** `07-deployment-variants` (MZ over http: chunked download + progressive decode, verified on the real MZ 1.7.0 scripts)
+
+---
+
+#### B22 — Medium: MZ — released buffers stay in memory — **FIXED 2026-09-30**
+
+**Where:** `_releaseBuffer`
+
+**What was wrong:** MV-style clean-up (nulling `_buffer`, `_sourceNode`) left MZ's decoded chunks (`_buffers[]`) and node array alive.
+
+**Fix:** `Engine.release(buffer)` disconnects every node and, on MZ, calls the buffer's `destroy()`. The dev test runner's `cleanup()` uses it too.
+
+**Covered by:** `02-playback` (stop releases the track), `08-dev-test-runner`
+
+---
+
+### MV (and MZ)
+
+#### B23 — High: Tracks auto-paused for a battle vanish on return — **FIXED 2026-09-30**
+
+**Where:** `cleanupOrphanedTracks`
+
+**What was wrong:** The just-resumed buffer was reaped as "dead": on MV `isPlaying()` is false until the file has been decoded, and a resumed track is a fresh buffer.
+
+**Fix:** A buffer that is still loading (`Engine.isLoading`) is never an orphan.
+
+**Covered by:** `03-scenes-and-saves` (persistence × pause matrix)
+
+---
+
+#### B24 — High: `seek()` drifts after pitch changes; low-pitched one-shots are cut short — **FIXED 2026-09-30**
+
+**Where:** `updateTrackPitch`, `_scheduleTrackEndAction`
+
+**What was wrong:** A pitch change ramped the source node's `playbackRate` and overwrote the engine's `_pitch`, but did not re-anchor `_startTime`. `seek()` is `(now − _startTime) × _pitch`, so it jumped after every pitch change — pause/resume and save then resumed at the wrong spot — and the engine's own end timer, created for the old speed, cut slowed-down SE/ME off.
+
+**Fix:** `Engine.setPlaybackRate` (see B18) keeps `_pitch`/`_startTime` consistent and re-arms the engine end timer; the plugin's own end action re-arms while time remains.
+
+**Covered by:** `02-playback` (seek stays accurate after pitch changes)
+
+---
+
+#### B25 — High: Effects requested while the file is still loading are never connected — **FIXED 2026-09-30**
+
+**Where:** `FugsAudio2Effects.js` `connectEffectChain` (+ new `hub._deferEffectConnect`)
+
+**What was wrong:** `play … {effect:…}`, `effect-…` right after `play-…`, and effects re-applied after a resume all ran before the source node existed; the chain was silently skipped.
+
+**Fix:** `validateBuffer` reports `pending` for a loading buffer and the chain is connected from the buffer's load listener.
+
+**Covered by:** `04-effects` (an effect issued right after play is applied as soon as the track starts)
+
+---
+
+#### B26 — Medium: `(pause:scene)` never resumes; typed `pauseall`/`resumeall` ignore the type — **FIXED 2026-09-30**
+
+**Where:** `handleSceneTransition`, `pauseAll`, `resumeAll`
+
+**What was wrong:** Tracks paused by `(pause:scene)` had no resume trigger. `pauseall-bgm` / `resumeall-bgm` (documented as `pauseall-[Type]`) hit every type.
+
+**Fix:** Scene-paused tracks are remembered (`_scenePausedKeys`) and resumed when the next `Scene_Map` is created — tracks you paused by hand are not. The type argument is honoured.
+
+**Covered by:** `03-scenes-and-saves`, `02-playback` (pauseall-bgm / resumeall-bgm only touch BGM)
+
+---
+
+#### B27 — Medium: Missing / mistyped audio file leaves a zombie track — **FIXED 2026-09-30**
+
+**Where:** `playAudio`, `resumeAudio` (new `_watchLoad`), `cleanupOrphanedTracks`
+
+**What was wrong:** A typo'd name kept a track that never played and was polled forever; `play-bgm1` with no file name asked the engine for `audio/bgm/undefined`.
+
+**Fix:** Empty names are rejected with a warning. A load that fails, or takes longer than 30 s (`LOAD_TIMEOUT_MS`), is reported as `Could not load audio/<type>/<name>` and the track is cleaned up.
+
+**Covered by:** `02-playback` (a missing audio file does not leave a zombie track or a busy timer loop)
+
+---
+
+#### B28 — Medium: `sidechain` by file name does not resolve — **FIXED 2026-09-30**
+
+**Where:** `FugsAudio4Dynamics.js` `setupSidechain` / `stopSidechain`
+
+**What was wrong:** The docs example `sidechain-bgm kick bass …` names tracks by file, but only numeric ids were understood.
+
+**Fix:** `hub._resolveBgmTrackId(ref)` accepts a track number or a (case-insensitive) file name.
+
+**Covered by:** `05-spatial-and-dynamics`
+
+---
+
+#### B29 — Medium: Pump node orphaned on track restart; no-arg `disconnect()` cuts sidechain taps — **FIXED 2026-09-30**
+
+**Where:** `FugsAudio4Dynamics.js` `ensurePumpNode`
+
+**What was wrong:** When a looping track was re-created, the pump stayed wired into the old nodes; and `gainNode.disconnect()` with no argument could also sever the sidechain analyser taps (listed under "Risky" earlier).
+
+**Fix:** The pump re-wires whenever the track's gain/panner nodes changed, keeps its level, and disconnects only its own edge (`disconnect(_pannerNode)`).
+
+**Covered by:** `05-spatial-and-dynamics` (the pump keeps working after a track restarts)
+
+---
+
+#### B30 — Low: Effects log a false `console.error` on every boot — **FIXED 2026-09-30**
+
+**Where:** `AudioEffects.init()`
+
+**What was wrong:** The engine creates its audio context *after* plugins load, so "no context yet" is normal at that point, but it was logged as an error.
+
+**Fix:** Logged at debug level; the context is picked up when it exists.
+
+**Covered by:** `01-boot-and-commands` (no console errors at load; Effects picks up the context created after plugin load)
+
+---
+
+#### B31 — Medium: MV on Android Chrome — BGM goes through the shared `Html5Audio` element — **FIXED 2026-09-30**
+
+**Where:** `Engine.createBuffer`
+
+**What was wrong:** MV plays BGM through one shared `<audio>` element on Android Chrome. It cannot host several independent tracks, and it hijacked the game's own BGM.
+
+**Fix:** For BGM in that situation the pack builds a regular WebAudio buffer itself.
+
+**Covered by:** `07-deployment-variants`
+
+---
+
+#### B32 — High: Returning from a battle is treated as a map change — **FIXED 2026-09-30**
+
+**Where:** `Scene_Battle.prototype.terminate`, `handleSceneTransition`
+
+**What was wrong:** The battle → map hand-off ran the normal "scene" clean-up, so `(p:battle)` ("survives battle") tracks and tracks paused for the battle were stopped and forgotten afterwards — contradicting the Docs behaviour table.
+
+**Fix:** New `"afterBattle"` transition: tracks that Pause or Continue in the table stay; tracks just resumed from a battle pause are protected from `none` persistence; `(p:none)` tracks started **during** the battle still end with it.
+
+**Behaviour change:** after a battle those tracks are no longer stopped. Use `(p:none)` if you relied on the old cut.
+
+**Covered by:** `03-scenes-and-saves` (the persistence × pause matrix and the `(p:none)` started-in-battle case)
+
+---
+
+#### B33 — Low: Alias `cooldown` swallows the first play shortly after startup — **FIXED 2026-09-30**
+
+**Where:** `FugsAudio6Aliases.js` `playAlias`
+
+**What was wrong:** The check `now - lastPlayed < cooldown` used `0` for "never played", so within the first `cooldown` milliseconds of `performance.now()` the very first play counted as a repeat.
+
+**Fix:** A missing timestamp means "not on cooldown".
+
+**Covered by:** `06-switch-aliases-compat` (cooldown suppresses rapid repeats)
+
+---
+
+#### B34 — Low: Core parameters ignored when the Core is renamed or the bundle is used under its own name — **FIXED 2026-09-30**
+
+**Where:** parameter loading at the top of `FugsMultiTrackAudioEX.js`
+
+**What was wrong:** Parameters were only read under the names `FugsAudio1Core` and `FugsMultiTrackAudioEX`. Plugin Manager stores them under the file's real name, so a renamed Core — or `dist/FugsMultiTrackAudioEX.bundle.js` enabled as it is — silently ran with the defaults, whatever was set in the dialog. (MZ plugin commands were already registered under the real name, see B19.)
+
+**Fix:** The Core remembers the file name it was loaded as and reads that first, then the two default names.
+
+**Covered by:** `01-boot-and-commands` (plugin parameters)
+
+---
+
+### Documentation corrected (in `FugsAudio0Docs.js`)
+
+MZ quick-start and the `Run Command` note; the `(loop:N)` / `(curve:name)` tags; the `madness` preset; sidechain arguments by number or file name; proximity updates every frame; transitions do not use snapshots; pause and battle-return semantics; the Options-menu volume note; the missing-file console message.
+
+### Still open (engine-level, by design or out of scope)
+
+- Fugs tracks ignore the **Options-menu BGM/BGS/ME/SE sliders** (documented; the engine's master volume still applies).
+- No `Scene_Gameover` hook (see the table below).
+- MZ web builds: resuming a paused track creates a new buffer, which fetches the file again.
+
 ## Risky / unconfirmed
 
 These look wrong or fragile but need runtime confirmation or sharper repros before promoting to confirmed bugs.
@@ -224,11 +482,11 @@ These look wrong or fragile but need runtime confirmation or sharper repros befo
 | Area | Notes | Approx. lines |
 |------|-------|---------------|
 | `syncPlay` / `startSyncedBuffers` | Schedules a future context time but never uses it; starts are only “close enough” (admitted in comments). | sync helpers |
-| `ensurePumpNode` + sidechain | `gainNode.disconnect()` with no args can sever analyzer taps. | pump / sidechain |
+| ~~`ensurePumpNode` + sidechain~~ | ~~`gainNode.disconnect()` with no args can sever analyzer taps.~~ Confirmed and fixed — see B29. | pump / sidechain |
 | `loadGame` ordering | `handleSceneTransition` then 100ms `loadAllStates("auto")` can race with prior fadeouts / context readiness. | ~7914–7922 |
 | `stopAllOfType` / `fadeAllOfType` | `key.startsWith(type)` is coarse (fine for `bgm`/`bgs`/`se`/`me` today). | ~5005+ |
 | Switch OFF | Only auto-stops `play` actions; fade/duck/effect switch commands don’t reverse except via duck restore. | SwitchBuffer |
-| `pluginCommand` quote re-parse | Only a subset of prefixes get full-string re-parse; `fadeall-*`, `duckall-*`, `chain-*`, `registeralias`, etc. may mishandle quoted names with spaces. | ~8055–8058 |
+| ~~`pluginCommand` quote re-parse~~ | ~~Only a subset of prefixes get full-string re-parse…~~ Not reproduced: the hook re-parses every registered command. Quoted names now verified on MV and on MZ (native command and imported MV events). | plugin commands |
 | Runtime `sfxAliases` | Aliases from `registeralias` are not in save data — lost on load. | alias + save |
 | No `Scene_Gameover` hook | Unlike `Scene_Title`, game over doesn’t auto-stop tracks. | ~7908–7911 vs missing |
 | `syncplay` without type | Parses as `type: "all"` → keys like `all_1` if dashless command used. | ~6873–6876, ~4409–4410 |
@@ -242,6 +500,7 @@ These look wrong or fragile but need runtime confirmation or sharper repros befo
 |------|----------|
 | 2026-07-16 | Initial pass: playback, fades, pause/resume, scene/battle hooks, switches, effects, sidechain, save/load, command parsing |
 | 2026-07-16 | Second pass: proximity, sidechain timing/leaks, save/load spatial state, bulk fade/duck consistency, gameover/alias risks |
+| 2026-09-30 | Compatibility audit for RPG Maker MV 1.6 and MZ 1.x: engine harness + ~170 scenarios per backend, real MZ 1.7.0 scripts, Chromium 65 syntax/API scan → B17–B34 |
 
 ---
 

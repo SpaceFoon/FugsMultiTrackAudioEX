@@ -445,51 +445,58 @@ const TestRunner = {
     return true;
   },
 
+  /**
+   * Stop a track's source node(s) and free its engine buffer.
+   * MV keeps one `_sourceNode`; MZ keeps a `_sourceNodes[]` array (chunked decoding) and needs
+   * destroy(). FugsAudio.engine hides that difference.
+   */
+  _severBuffer(buf) {
+    if (!buf) return;
+    try {
+      const engine = FugsAudio.engine;
+      const nodes = engine ? engine.sourceNodes(buf) : buf._sourceNode ? [buf._sourceNode] : [];
+      for (const node of nodes) {
+        try {
+          node.stop();
+        } catch (_e) {
+          /* ok */
+        }
+      }
+      if (engine) {
+        engine.release(buf);
+      } else {
+        buf._buffer = null;
+        if (buf._sourceNode) {
+          try {
+            buf._sourceNode.disconnect();
+          } catch (_e) {
+            /* ok */
+          }
+          buf._sourceNode = null;
+        }
+        ["_gainNode", "_pannerNode"].forEach((prop) => {
+          if (buf[prop]) {
+            try {
+              buf[prop].disconnect();
+            } catch (_e) {
+              /* ok */
+            }
+            buf[prop] = null;
+          }
+        });
+      }
+    } catch (_e) {
+      /* best effort */
+    }
+  },
+
   async cleanup() {
     // Cancel all active fades first to prevent them from resurrecting references
     FugsAudio.FadeManager.cancelAllFades();
 
     // Release decoded PCM AudioBuffers BEFORE stopAll empties the Map.
     // These are multi-MB each and the primary memory consumer.
-    for (const [, buf] of FugsAudio.tracks) {
-      try {
-        if (buf) {
-          buf._buffer = null;
-          // Also sever node refs so the context can release them
-          if (buf._sourceNode) {
-            try {
-              buf._sourceNode.stop();
-            } catch (_e) {
-              /* ok */
-            }
-            try {
-              buf._sourceNode.disconnect();
-            } catch (_e) {
-              /* ok */
-            }
-            buf._sourceNode = null;
-          }
-          if (buf._gainNode) {
-            try {
-              buf._gainNode.disconnect();
-            } catch (_e) {
-              /* ok */
-            }
-            buf._gainNode = null;
-          }
-          if (buf._pannerNode) {
-            try {
-              buf._pannerNode.disconnect();
-            } catch (_e) {
-              /* ok */
-            }
-            buf._pannerNode = null;
-          }
-        }
-      } catch (_e) {
-        /* best effort */
-      }
-    }
+    for (const [, buf] of FugsAudio.tracks) this._severBuffer(buf);
     FugsAudio.tracks.clear();
 
     // Dispose any orphaned effect chains that weren't associated with a live track
@@ -540,44 +547,8 @@ const TestRunner = {
     FugsAudio.FadeManager.cancelAllFades();
 
     // 2. Force-stop every buffer and sever all WebAudio node references
-    //    so the old context owns zero live JS references.
-    for (const [, buf] of FugsAudio.tracks) {
-      try {
-        if (buf._sourceNode) {
-          try {
-            buf._sourceNode.stop();
-          } catch (_e) {
-            /* ok */
-          }
-          try {
-            buf._sourceNode.disconnect();
-          } catch (_e) {
-            /* ok */
-          }
-          buf._sourceNode = null;
-        }
-        if (buf._gainNode) {
-          try {
-            buf._gainNode.disconnect();
-          } catch (_e) {
-            /* ok */
-          }
-          buf._gainNode = null;
-        }
-        if (buf._pannerNode) {
-          try {
-            buf._pannerNode.disconnect();
-          } catch (_e) {
-            /* ok */
-          }
-          buf._pannerNode = null;
-        }
-        // Release the decoded PCM AudioBuffer (multi-MB each)
-        buf._buffer = null;
-      } catch (_e) {
-        /* best effort */
-      }
-    }
+    //    so the old context owns zero live JS references (and free decoded PCM, multi-MB each).
+    for (const [, buf] of FugsAudio.tracks) this._severBuffer(buf);
     FugsAudio.tracks.clear();
 
     // 3. Dispose all effect chains (disconnects every node in the chain)
@@ -1593,10 +1564,8 @@ TestRunner.add("fade:pitch:automation", async function () {
   this.assert(midPitch < startPitch, "Pitch moves downward during fade");
   this.assert(this.approx(endPitch, 0.8, 0.1), "Pitch reaches ~80% target");
 
-  const rate =
-    buf._sourceNode && buf._sourceNode.playbackRate
-      ? buf._sourceNode.playbackRate.value
-      : buf.pitch;
+  const liveNode = FugsAudio.engine.sourceNodes(buf)[0];
+  const rate = liveNode && liveNode.playbackRate ? liveNode.playbackRate.value : buf.pitch;
   if (typeof rate === "number") {
     this.assert(
       rate < startPitch && rate <= endPitch + 0.15,

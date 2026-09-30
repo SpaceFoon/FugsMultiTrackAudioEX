@@ -176,8 +176,69 @@ forEachBackend("MZ plugin-command registration", (b) => {
   });
 });
 
+forEachBackend("plugin parameters", (b) => {
+  const PARAMS = { "Default Persistence Mode": "always", "Default Pause Mode": "never", "Scene Fadeout Time": "1.5" };
+
+  it("are read under the file name the Core was loaded as (renamed Core, or the bundle's own name)", async () => {
+    const env = await createEnv(b.cfg);
+    env.addDefaultAudio();
+    env.loadPlugin("FugsMultiTrackAudioEX.js", "MyRenamedAudioCore", PARAMS);
+    env.bootAudio();
+    const cfg = env.A.config;
+    assert.equal(cfg.defaultPersistenceMode, "always");
+    assert.equal(cfg.defaultPauseMode, "never");
+    assert.equal(cfg.sceneFadeoutTime, 1.5);
+  });
+
+  it("are still read under the default file name", async () => {
+    const env = await createEnv(b.cfg);
+    env.addDefaultAudio();
+    env.loadPlugin("FugsMultiTrackAudioEX.js", "FugsMultiTrackAudioEX", PARAMS);
+    env.bootAudio();
+    assert.equal(env.A.config.defaultPersistenceMode, "always");
+    assert.equal(env.A.config.sceneFadeoutTime, 1.5);
+  });
+
+  it("and FugsAudio1Core (the documented alternative name) is honoured too", async () => {
+    const env = await createEnv(b.cfg);
+    env.addDefaultAudio();
+    env.loadPlugin("FugsMultiTrackAudioEX.js", "FugsAudio1Core", PARAMS);
+    env.bootAudio();
+    assert.equal(env.A.config.defaultPauseMode, "never");
+  });
+
+  it("fall back to the defaults when nothing is configured", async () => {
+    const env = await boot(b);
+    const cfg = env.A.config;
+    assert.equal(cfg.defaultPersistenceMode, "scene");
+    assert.equal(cfg.defaultPauseMode, "battle");
+    assert.equal(cfg.sceneFadeoutTime, 0.5);
+  });
+});
+
 forEachBackend("MV plugin command specifics", (b) => {
   if (b.cfg.engine !== "mv") return;
+
+  it("an MV project carrying a PluginManager.registerCommand shim is still driven as MV", async () => {
+    const env = await createEnv(b.cfg);
+    env.addDefaultAudio();
+    // Some MV projects load a shim that adds MZ's registerCommand so MZ-style plugins can run.
+    env.run("window.__shimCalls = 0; PluginManager.registerCommand = function () { window.__shimCalls++; };");
+    env.loadPack();
+    env.bootAudio();
+    env.enterMap();
+    await env.advance(5000);
+    assert.equal(env.A.engine.name, "MV");
+    await env.runCommand("play-bgm1 Theme 90");
+    await env.settle();
+    assert.ok(
+      env.requests.includes("audio/bgm/Theme.ogg"),
+      "MV folder form ('bgm', no trailing slash) expected; got " + JSON.stringify(env.requests)
+    );
+    assert.deepEqual(keys(env), ["bgm_1"]);
+    assert.equal(env.run("window.__shimCalls"), 0, "no MZ command registration is attempted on MV");
+    assert.deepEqual(pluginErrors(env), []);
+  });
 
   it("does not require (or choke on) MZ-only APIs", async () => {
     const env = await boot(b);

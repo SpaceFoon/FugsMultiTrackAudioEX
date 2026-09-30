@@ -116,10 +116,58 @@ async function play(env, text, settleMs) {
   await env.settle(settleMs == null ? 300 : settleMs);
 }
 
+/**
+ * Run the shipped dev-only in-game suite (FugsAudio8Test, i.e. `test("<group>")` in the F8
+ * console) inside the harness and return its { passed, failed, skipped } counters.
+ *
+ * Stubbed, because a Node vm has no NW.js: the game's audio-folder listing (fs) and $dataSystem.
+ * `o.exclude` removes individual tests first (those that need a REAL audio signal from an
+ * AnalyserNode, which the fake Web Audio graph does not produce).
+ */
+async function runInGameTests(env, pattern, o) {
+  o = o || {};
+  env.sandbox.__audioList = (type) => {
+    const out = [];
+    for (const k of env.files.keys()) {
+      const m = /^audio\/([^/]+)\/(.+)\.(ogg|m4a)$/.exec(k);
+      if (m && m[1] === type) out.push(decodeURIComponent(m[2]));
+    }
+    return out;
+  };
+  env.run(`
+    window.$dataSystem = window.$dataSystem || {};
+    TestRunner.scanFolder = function (type) { return window.__audioList(type); };
+    TestRunner.reset();
+  `);
+  for (const name of o.exclude || []) env.run(`TestRunner.tests.delete(${JSON.stringify(name)})`);
+
+  let settled = false;
+  let failure = null;
+  Promise.resolve(env.run(`window.test(${JSON.stringify(pattern)})`)).then(
+    () => {
+      settled = true;
+    },
+    (e) => {
+      settled = true;
+      failure = e;
+    }
+  );
+  for (let i = 0; i < (o.maxSteps || 60000) && !settled; i++) await env.advance(50, { map: false });
+  if (failure) throw failure;
+  if (!settled) throw new Error(`in-game test "${pattern}" did not finish`);
+  return {
+    passed: env.run("TestRunner.results.passed"),
+    failed: env.run("TestRunner.results.failed"),
+    skipped: env.run("TestRunner.results.skipped"),
+    failedTests: Array.from(env.run("TestRunner.failedTests")).map(String),
+  };
+}
+
 module.exports = {
   backends,
   forEachBackend,
   boot,
+  runInGameTests,
   sourcesOf,
   audibleSourcesOf,
   gainOf,

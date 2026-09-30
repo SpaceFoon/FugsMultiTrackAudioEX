@@ -110,11 +110,31 @@
  */
 
 (() => {
+  // The file name (without .js) this script was loaded as. Users rename plugins, and the all-in-one
+  // bundle has its own name; Plugin Manager stores parameters and MZ registers commands under it.
+  // Only available while the script is executing, so read it once, right here.
+  const OWN_SCRIPT_NAME = (() => {
+    try {
+      const src = typeof document !== "undefined" && document.currentScript && document.currentScript.src;
+      if (!src) return "";
+      let file = String(src).split("?")[0].split("/").pop() || "";
+      try {
+        file = decodeURIComponent(file);
+      } catch (_e) {
+        /* keep the raw name */
+      }
+      return file.replace(/\.js$/i, "");
+    } catch (_e) {
+      return "";
+    }
+  })();
+
   function readPluginParams(name) {
-    const p = PluginManager.parameters(name);
+    const p = name ? PluginManager.parameters(name) : null;
     return p && typeof p === "object" && Object.keys(p).length > 0 ? p : null;
   }
   const params =
+    readPluginParams(OWN_SCRIPT_NAME) ||
     readPluginParams("FugsAudio1Core") ||
     readPluginParams("FugsMultiTrackAudioEX") ||
     {};
@@ -370,9 +390,13 @@
   //       isPlaying():   "has a source node" -> false until decoded
   //       BGM on Android Chrome goes through the shared Html5Audio element
   const Engine = {
+    // The engine says what it is. Only when it does not (very old cores) fall back to sniffing
+    // for MZ's PluginManager.registerCommand — an MV project may carry a shim that adds that
+    // function, and must still be driven with MV's folder names and single source node.
     isMZ:
-      (typeof Utils !== "undefined" && Utils.RPGMAKER_NAME === "MZ") ||
-      (typeof PluginManager !== "undefined" && typeof PluginManager.registerCommand === "function"),
+      typeof Utils !== "undefined" && typeof Utils.RPGMAKER_NAME === "string"
+        ? Utils.RPGMAKER_NAME === "MZ"
+        : typeof PluginManager !== "undefined" && typeof PluginManager.registerCommand === "function",
 
     get name() {
       return this.isMZ ? "MZ" : "MV";
@@ -4488,17 +4512,7 @@
     //     actually loaded as (users rename plugins), plus the default names.
     if (Engine.isMZ && typeof PluginManager.registerCommand === "function") {
       const fileNames = ["FugsMultiTrackAudioEX", "FugsAudio1Core"];
-      const src = typeof document !== "undefined" && document.currentScript && document.currentScript.src;
-      if (src) {
-        let file = String(src).split("?")[0].split("/").pop() || "";
-        try {
-          file = decodeURIComponent(file);
-        } catch (_e) {
-          /* keep raw */
-        }
-        file = file.replace(/\.js$/i, "");
-        if (file && fileNames.indexOf(file) === -1) fileNames.unshift(file);
-      }
+      if (OWN_SCRIPT_NAME && fileNames.indexOf(OWN_SCRIPT_NAME) === -1) fileNames.unshift(OWN_SCRIPT_NAME);
       fileNames.forEach((pluginName) => {
         PluginManager.registerCommand(pluginName, "run", function (args) {
           FugsMultiTrackAudioEX.runCommandText(args && args.command);
