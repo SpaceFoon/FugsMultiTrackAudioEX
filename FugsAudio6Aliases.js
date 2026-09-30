@@ -2,8 +2,8 @@
 //                        FugsAudio6Aliases.js                           //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 SFX alias pools + humanizer for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 SFX alias pools + humanizer for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help

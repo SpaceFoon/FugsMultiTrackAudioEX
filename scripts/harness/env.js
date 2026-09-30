@@ -427,8 +427,15 @@ async function createEnv(opts) {
   /** Load the plugin pack in Plugin Manager order. `which` = keys to load (default: full runtime pack). */
   env.loadPack = function (which) {
     const wanted = which || ["core", "docs", "effects", "spatial", "dynamics", "switch", "aliases", "compat"];
+    const useBundle = opts.bundle || !!process.env.HARNESS_BUNDLE;
     for (const p of PACK_ORDER) {
       if (!wanted.includes(p.key)) continue;
+      if (useBundle && p.key === "core") {
+        // The generated all-in-one plugin replaces Core + satellites 2..7 (README: do not enable both).
+        env.loadPlugin(path.join(REPO_ROOT, "dist", "FugsMultiTrackAudioEX.bundle.js"), p.name);
+        continue;
+      }
+      if (useBundle && ["effects", "spatial", "dynamics", "switch", "aliases", "compat"].includes(p.key)) continue;
       env.loadPlugin(p.file, p.name);
     }
     return env;

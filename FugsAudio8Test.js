@@ -2,8 +2,8 @@
 //                         FugsAudio8Test.js                             //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Dev-only test runner for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Dev-only test runner for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help

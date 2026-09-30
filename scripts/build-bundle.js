@@ -40,7 +40,7 @@ function rewriteCoreHeader(src) {
   return src
     .replace(
       /@plugindesc[^\n]*/,
-      "@plugindesc v2.2 Fugs MultiTrack Audio — ALL-IN-ONE BUNDLE (Core+Effects+Spatial+Dynamics+Switch+Aliases+Compat)"
+      "@plugindesc v2.3 Fugs MultiTrack Audio — ALL-IN-ONE BUNDLE (Core+Effects+Spatial+Dynamics+Switch+Aliases+Compat)"
     )
     .replace(
       /Fugs MultiTrack Audio — CORE/,

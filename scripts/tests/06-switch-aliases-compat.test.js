@@ -141,7 +141,7 @@ forEachBackend("compat and console helpers", (b) => {
     // 2. Core only: satellite commands warn instead of throwing
     env = await createEnv(b.cfg);
     env.addDefaultAudio();
-    env.loadPack(["core"]);
+    env.loadPlugin("FugsMultiTrackAudioEX.js", "FugsMultiTrackAudioEX"); // Core file only, never the bundle
     env.bootAudio();
     env.enterMap();
     await env.runCommand("play-bgm1 Theme 90");

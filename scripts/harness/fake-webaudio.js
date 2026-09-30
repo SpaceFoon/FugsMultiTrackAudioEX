@@ -615,9 +615,14 @@ function createFakeAudio(clock, opts) {
             const text = Buffer.from(bytes).toString("latin1");
             const at = text.indexOf("FAKEAUDIO");
             if (at !== 0) throw new Error("EncodingError: unable to decode audio data");
-            const meta = JSON.parse(text.slice("FAKEAUDIO".length));
+            const headerEnd = text.indexOf("}") + 1;
+            const meta = JSON.parse(text.slice("FAKEAUDIO".length, headerEnd));
             const rate = meta.sampleRate || self.sampleRate;
-            const buf = new FakeAudioBuffer(meta.channels || 2, Math.round(meta.duration * rate), rate, meta.duration);
+            // Streamed (partial) data decodes to the fraction of the audio received so far,
+            // like a real progressive Ogg decode; complete data decodes to the full duration.
+            let duration = meta.duration;
+            if (meta.total && bytes.length < meta.total) duration = (meta.duration * bytes.length) / meta.total;
+            const buf = new FakeAudioBuffer(meta.channels || 2, Math.max(1, Math.round(duration * rate)), rate, duration);
             if (typeof success === "function") success(buf);
             resolve(buf);
           } catch (e) {

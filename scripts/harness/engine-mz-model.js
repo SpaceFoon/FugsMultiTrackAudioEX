@@ -292,12 +292,87 @@ WebAudio.prototype.retry = function () {
 WebAudio.prototype._startLoading = function () {
   if (WebAudio._context) {
     var url = this._url + (Utils.hasEncryptedAudio() ? "_" : "");
-    this._startXhrLoading(url);
+    if (Utils.isLocal()) {
+      this._startXhrLoading(url);
+    } else {
+      this._startFetching(url);
+    }
     var currentTime = WebAudio._currentTime();
     this._lastUpdateTime = currentTime - 0.5;
     this._isError = false;
     this._isLoaded = false;
   }
+};
+
+// Web deployment: the file is fetched in chunks and decoded progressively.
+WebAudio.prototype._startFetching = function (url) {
+  var options = { credentials: "same-origin" };
+  fetch(url, options)
+    .then((response) => this._onFetch(response))
+    .catch(() => this._onError());
+};
+
+WebAudio.prototype._onFetch = function (response) {
+  if (response.ok) {
+    var reader = response.body.getReader();
+    var readChunk = (result) => {
+      if (result.done) {
+        this._isLoaded = true;
+        if (this._fetchedSize > 0) {
+          this._concatenateFetchedData();
+          this._updateBuffer();
+          this._data = null;
+        }
+        return 0;
+      } else {
+        this._onFetchProcess(result.value);
+        return reader.read().then(readChunk);
+      }
+    };
+    reader
+      .read()
+      .then(readChunk)
+      .catch(() => this._onError());
+  } else {
+    this._onError();
+  }
+};
+
+WebAudio.prototype._onFetchProcess = function (value) {
+  this._fetchedSize += value.length;
+  this._fetchedData.push(value);
+  this._updateBufferOnFetch();
+};
+
+// Decode the data received so far at most once per second (and only past ~200 KB).
+WebAudio.prototype._updateBufferOnFetch = function () {
+  var currentTime = WebAudio._currentTime();
+  var deltaTime = currentTime - this._lastUpdateTime;
+  var currentData = this._data;
+  var currentSize = currentData ? currentData.length : 0;
+  if (deltaTime >= 1 && currentSize + this._fetchedSize >= 200000) {
+    this._concatenateFetchedData();
+    this._updateBuffer();
+    this._lastUpdateTime = currentTime;
+  }
+};
+
+WebAudio.prototype._concatenateFetchedData = function () {
+  var currentData = this._data;
+  var currentSize = currentData ? currentData.length : 0;
+  var newData = new Uint8Array(currentSize + this._fetchedSize);
+  var pos = 0;
+  if (currentData) {
+    newData.set(currentData);
+    pos += currentSize;
+  }
+  for (var i = 0; i < this._fetchedData.length; i++) {
+    newData.set(this._fetchedData[i], pos);
+    pos += this._fetchedData[i].length;
+  }
+  this._data = newData;
+  this._fetchedData = [];
+  this._fetchedSize = 0;
 };
 
 WebAudio.prototype._destroyDecoder = function () {

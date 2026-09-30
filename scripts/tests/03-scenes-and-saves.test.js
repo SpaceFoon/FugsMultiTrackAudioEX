@@ -13,17 +13,16 @@ const {
 const near = (a, b, tol, msg) => assert.ok(Math.abs(a - b) <= tol, `${msg || "value"}: expected ${b} +/- ${tol}, got ${a}`);
 
 // From FugsAudio0Docs "Behavior table":  persistence | pauseMode | Menu | Battle
-// The 5th column is what must be true AFTER returning from battle. "?" = the Docs do not
-// say (e.g. persistence "battle"/"none" tracks are subject to the map-return scene transition),
-// so it is deliberately not asserted.
+// The 5th column is what must be true AFTER returning from battle: a track that Continues
+// through the battle is still there, a track that Pauses comes back, a track that Stops stays gone.
 const TABLE = [
   ["none", "never", "Continues", "Stops", "Stops"],
   ["none", "menu", "Pauses", "Stops", "Stops"],
-  ["none", "battle", "Continues", "Pauses", "?"],
+  ["none", "battle", "Continues", "Pauses", "Continues"],
   ["scene", "never", "Continues", "Stops", "Stops"],
   ["scene", "battle", "Continues", "Pauses", "Continues"],
-  ["battle", "never", "Continues", "Continues", "?"],
-  ["battle", "battle", "Continues", "Pauses", "?"],
+  ["battle", "never", "Continues", "Continues", "Continues"],
+  ["battle", "battle", "Continues", "Pauses", "Continues"],
   ["always", "never", "Continues", "Continues", "Continues"],
   ["always", "menu", "Pauses", "Continues", "Continues"],
   ["always", "battle", "Continues", "Pauses", "Continues"],
@@ -64,7 +63,7 @@ forEachBackend("scene policy table", (b) => {
       assertState(env, "bgm_1", battle, "in battle");
       env.scene.battleToMap();
       await env.advance(1000);
-      if (afterBattle !== "?") assertState(env, "bgm_1", afterBattle, "after returning from battle");
+      assertState(env, "bgm_1", afterBattle, "after returning from battle");
     });
   }
 
@@ -77,6 +76,29 @@ forEachBackend("scene policy table", (b) => {
     env.scene.battleToMap();
     await env.advance(1000);
     assertState(env, "bgm_1", "Continues", "default: resumes after battle");
+  });
+
+  it("(p:none) started DURING a battle ends with that battle; (p:scene) and (p:always) started there stay", async () => {
+    const env = await boot(b);
+    env.scene.mapToBattle();
+    await env.runCommand("play-bgm1 Theme 90 (p:none) (pause:never)");
+    await env.runCommand("play-bgm2 Bass 90 (p:scene) (pause:never)");
+    await env.runCommand("play-bgm3 Pads 90 (p:always) (pause:never)");
+    await env.settle();
+    env.scene.battleToMap();
+    await env.advance(1000);
+    assert.deepEqual(keys(env), ["bgm_2", "bgm_3"]);
+  });
+
+  it("a track you paused by hand is not resumed by a battle ending unless it is a (pause:battle) track", async () => {
+    const env = await boot(b);
+    await play(env, "play-bgm1 Theme 90 (p:always) (pause:never)");
+    await env.runCommand("pause-bgm1");
+    env.scene.mapToBattle();
+    await env.advance(800);
+    env.scene.battleToMap();
+    await env.advance(800);
+    assert.equal(env.A.pausedTracks.has("bgm_1"), true, "still paused: the player never asked for it to resume");
   });
 
   it("map transfer: (p:none) stops, (p:always)/(p:scene) continue, (p:battle) stops", async () => {

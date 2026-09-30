@@ -2,8 +2,8 @@
 //                      FugsMultiTrackAudioEX.js                         //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Unlimited audio tracks with mixing controls
- * @target MV 1.63
+ * @plugindesc v2.3 Unlimited audio tracks with mixing controls (RPG Maker MV + MZ)
+ * @target MZ
  * @author Fug
  *
  * @param Debug Logs
@@ -61,12 +61,40 @@
  * @value scene
  * @default battle
  *
+ * @command run
+ * @text Run Command
+ * @desc Run one Fugs audio command, exactly like the classic plugin command. Example: play-bgm1 ThemeSong 90 2
+ *
+ * @arg command
+ * @text Command
+ * @type string
+ * @desc Full command text, e.g.  play-bgm1 ThemeSong 90 2   |   fade-bgm1 0 3   |   effect-bgm1 preset:cave
+ *
+ * @command runMultiple
+ * @text Run Commands (one per line)
+ * @desc Run several Fugs audio commands in order, one per line. Blank lines and lines starting with // or # are ignored.
+ *
+ * @arg commands
+ * @text Commands
+ * @type multiline_string
+ * @desc One command per line, e.g.  play-bgm1 ThemeSong   (next line)   effect-bgm1 preset:cave
+ *
  * @help
  * =========================================================================
- * Fugs MultiTrack Audio — CORE
+ * Fugs MultiTrack Audio — CORE   (RPG Maker MV 1.6+ and MZ)
  * =========================================================================
  * Mixer: play / stop / fade / crossfade / pause / resume / save / load /
  * syncplay / chain / pitch / pan / listall.
+ *
+ * HOW TO CALL COMMANDS
+ *   MV:  Event -> Plugin Command, then type the command:
+ *          play-bgm1 ThemeSong 90 2
+ *   MZ:  Event -> Plugin Command, pick this plugin (FugsMultiTrackAudioEX),
+ *        command "Run Command", and type the very same text in the Command box.
+ *        "Run Commands (one per line)" runs several at once.
+ *        (Events imported from an MV project that use "Plugin Command (MV)"
+ *        keep working unchanged.)
+ *   Both: the FugsAudio script-call API, e.g. FugsAudio.play('bgm', 1, 'Theme').
  *
  * Full command playbook, presets, spatial, dynamics, switches, aliases:
  *   Install and open  FugsAudio0Docs  in Plugin Manager.
@@ -3420,7 +3448,13 @@
     },
 
     // Scene transition handling
-    handleSceneTransition(transitionType, fadeoutDuration = SceneFadeoutTime) {
+    //   transitionType: "scene"       map change / new game / load
+    //                   "battle"      entering a battle
+    //                   "afterBattle" returning from a battle to the map
+    //                   "menu"        (pause handling only; the menu never stops tracks)
+    //   protectedKeys:  tracks that must not be stopped by "none" persistence this time
+    //                   (tracks that were auto-paused for the battle and have just been resumed)
+    handleSceneTransition(transitionType, fadeoutDuration = SceneFadeoutTime, protectedKeys) {
       Logger.info(`Handling ${transitionType} transition with ${fadeoutDuration}s fadeout`);
 
       // Clear any tracks from previous scenes that might be lingering
@@ -3442,13 +3476,16 @@
             shouldStop = false;
             break;
           case "battle":
+            // "Survives battle, stops for map changes": returning from a battle is NOT a map change.
             shouldStop = transitionType === "scene";
             break;
           case "scene":
             shouldStop = transitionType === "battle";
             break;
           case "none":
-            shouldStop = true;
+            // Stops on any transition. Exception: a track that was paused for the battle
+            // (pause takes priority over stop) and has just been resumed comes back.
+            shouldStop = !(protectedKeys && protectedKeys.has(key));
             break;
         }
 
@@ -3463,7 +3500,8 @@
             shouldPause = transitionType === "battle";
             break;
           case "scene":
-            shouldPause = transitionType === "scene";
+            // Leaving a battle re-creates the map scene, which counts as a scene change.
+            shouldPause = transitionType === "scene" || transitionType === "afterBattle";
             break;
         }
 
@@ -3477,7 +3515,9 @@
           const wasPaused = this.pausedTracks.has(key);
           this.pauseAudio(type, trackId, [fadeoutDuration]);
           // Remember scene-change pauses so the next map scene can bring them back.
-          if (transitionType === "scene" && !wasPaused) this._scenePausedKeys.add(key);
+          if ((transitionType === "scene" || transitionType === "afterBattle") && !wasPaused) {
+            this._scenePausedKeys.add(key);
+          }
         } else if (shouldStop) {
           const [type, trackId] = key.split("_");
 
@@ -4338,7 +4378,13 @@
           FugsMultiTrackAudioEX.resumeAudio(type, trackId, []);
           Logger.info(`Resumed ${key} after battle exit`);
         });
-        FugsMultiTrackAudioEX.handleSceneTransition("scene", SceneFadeoutTime);
+        // "afterBattle", not "scene": returning to the map is not a map change, so tracks that
+        // survive battles ((p:battle)) or were paused for it keep playing.
+        FugsMultiTrackAudioEX.handleSceneTransition(
+          "afterBattle",
+          SceneFadeoutTime,
+          new Set(battlePausedTracks)
+        );
       }
     };
 

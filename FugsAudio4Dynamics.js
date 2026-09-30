@@ -2,8 +2,8 @@
 //                        FugsAudio4Dynamics.js                          //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Duck, sidechain, pump, pitchbendall for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Duck, sidechain, pump, pitchbendall for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help
