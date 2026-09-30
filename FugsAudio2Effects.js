@@ -50,11 +50,16 @@
     console.error(TAG + " AUDIO_CONSTANTS missing on FugsAudio — aborting Effects load.");
     return;
   }
+  if (!hub.engine) {
+    console.error(TAG + " FugsAudio.engine missing — update FugsMultiTrackAudioEX (Core) to the same version as this plugin.");
+    return;
+  }
 
   // Audio Effects System with immutable presets
-  // IMPORTANT: This system relies on RPG Maker MV's internal WebAudio implementation
-  // Specifically: WebAudio._context, buffer._sourceNode, buffer._gainNode
-  // These are private APIs and may break if modified by other plugins
+  // IMPORTANT: This system relies on RPG Maker's internal WebAudio implementation
+  // Specifically: WebAudio._context, the buffer's source node(s) and buffer._gainNode.
+  // MV keeps one `_sourceNode`, MZ an array `_sourceNodes[]`; FugsAudio.engine (Core) hides
+  // that difference. These are private APIs and may break if modified by other plugins.
   const AudioEffects = {
     context: null,
     curveCache: {},
@@ -69,7 +74,9 @@
         this.context = WebAudio._context;
         Logger.success("Audio Effects System initialized");
       } else {
-        Logger.error("Failed to initialize Audio Effects System: No WebAudio context found");
+        // Expected while plugins load: MV and MZ create the AudioContext AFTER all plugin
+        // scripts have run (SceneManager.initAudio). applyEffect() attaches to it on first use.
+        Logger.debug("Audio Effects System: WebAudio context not created yet - will attach on first use");
       }
     },
 
@@ -87,16 +94,25 @@
       if (!buffer) {
         return { valid: false, reason: "Buffer is null/undefined" };
       }
-      if (!buffer._sourceNode) {
-        return { valid: false, reason: "Missing _sourceNode (WebAudio internal)" };
+      // MV keeps ONE source node (buffer._sourceNode), MZ an array (buffer._sourceNodes[]).
+      const sources = hub.engine ? hub.engine.sourceNodes(buffer) : buffer._sourceNode ? [buffer._sourceNode] : [];
+      if (sources.length === 0) {
+        // No source node yet = the audio file is still loading/decoding; the engine creates the
+        // nodes when it starts playing. Callers defer instead of failing.
+        const loading = hub.engine ? hub.engine.isLoading(buffer) : false;
+        return {
+          valid: false,
+          pending: loading,
+          reason: "No source node yet (WebAudio internal: _sourceNode / _sourceNodes)",
+        };
       }
       if (!buffer._gainNode) {
         return { valid: false, reason: "Missing _gainNode (WebAudio internal)" };
       }
-      if (!buffer._sourceNode.context) {
+      if (!sources[0].context) {
         return { valid: false, reason: "SourceNode has no AudioContext" };
       }
-      if (buffer._sourceNode.context.state === "closed") {
+      if (sources[0].context.state === "closed") {
         return { valid: false, reason: "AudioContext is closed" };
       }
       return { valid: true };
@@ -1388,6 +1404,21 @@
   };
 
   // --- Track-level effect integration (lives on hub) ---
+
+  // The audio file is still loading (no source nodes yet): connect the chain as soon as the
+  // engine has started playing. The engine's own play() load-listener was registered first, so
+  // by the time this one runs the source/gain nodes exist.
+  hub._deferEffectConnect = function(key, buffer) {
+      if (!buffer || typeof buffer.addLoadListener !== "function") return;
+      if (buffer._fugsEffectConnectPending) return;
+      buffer._fugsEffectConnectPending = true;
+      buffer.addLoadListener(() => {
+        buffer._fugsEffectConnectPending = false;
+        if (this.tracks.get(key) !== buffer || !this.effectChains.has(key)) return;
+        this.connectEffectChain(key, buffer);
+      });
+  };
+
   hub.connectEffectChain = function(key, buffer) {
       const chain = this.effectChains.get(key);
       if (!chain) return false;
@@ -1395,6 +1426,11 @@
       // Validate buffer has required WebAudio internals
       const validation = AudioEffects.validateBuffer(buffer, key);
       if (!validation.valid) {
+        if (validation.pending) {
+          Logger.effect(`Effect chain for ${key} waits for the audio file to load`);
+          this._deferEffectConnect(key, buffer);
+          return false;
+        }
         Logger.warn(`Cannot connect effects for ${key}: ${validation.reason}`);
         Logger.warn("This may indicate plugin conflicts or WebAudio internals changed");
         return false;
@@ -1404,18 +1440,14 @@
         // Disconnect old connections before reconnecting
         // Wrap in try/catch - nodes may already be disconnected
         try {
-          buffer._sourceNode.disconnect();
-        } catch (_) {
-          Logger.effect(`_reconnectEffectChain: sourceNode already disconnected (expected)`);
-        }
-        try {
           chain.output.disconnect();
         } catch (_) {
           Logger.effect(`_reconnectEffectChain: chain output already disconnected (expected)`);
         }
 
-        // Connect the new buffer
-        buffer._sourceNode.connect(chain.input);
+        // Route every source node (MV: one, MZ: one per decoded chunk) through the chain
+        // instead of straight into the gain node, then chain -> gain.
+        hub.engine.routeSources(buffer, chain.input);
         chain.output.connect(buffer._gainNode);
         Logger.effect(`Connected effect chain for ${key}`);
         return true;
@@ -1431,16 +1463,18 @@
 
       // Best-effort disconnect: WebAudio disconnect() can throw if already disconnected.
       try {
-        if (buffer && restoreRouting && buffer._sourceNode && buffer._gainNode) {
-          try {
-            buffer._sourceNode.disconnect(chain.input);
-          } catch (_e) {
-            Logger.debugOnce(
-              "disposeEffectChain: disconnect old routing (source->chain) failed",
-              {},
-              "disposeEffectChain.disconnectOldRouting.source"
-            );
-          }
+        if (buffer && restoreRouting && buffer._gainNode && hub.engine.sourceNodes(buffer).length > 0) {
+          hub.engine.sourceNodes(buffer).forEach((sourceNode) => {
+            try {
+              sourceNode.disconnect(chain.input);
+            } catch (_e) {
+              Logger.debugOnce(
+                "disposeEffectChain: disconnect old routing (source->chain) failed",
+                {},
+                "disposeEffectChain.disconnectOldRouting.source"
+              );
+            }
+          });
           try {
             chain.output.disconnect(buffer._gainNode);
           } catch (_e) {
@@ -1551,25 +1585,28 @@
 
       // Restore default routing (source -> gain) if the track is still live.
       try {
-        if (buffer && restoreRouting && buffer._sourceNode && buffer._gainNode) {
-          try {
-            buffer._sourceNode.disconnect();
-          } catch (_e) {
-            Logger.debugOnce(
-              "disposeEffectChain: restore routing disconnect failed",
-              {},
-              "disposeEffectChain.restoreRouting.disconnect"
-            );
-          }
-          try {
-            buffer._sourceNode.connect(buffer._gainNode);
-          } catch (_e) {
-            Logger.debugOnce(
-              "disposeEffectChain: restore routing connect failed",
-              {},
-              "disposeEffectChain.restoreRouting.connect"
-            );
-          }
+        if (buffer) hub.engine.unrouteSources(buffer);
+        if (buffer && restoreRouting && buffer._gainNode && hub.engine.sourceNodes(buffer).length > 0) {
+          hub.engine.sourceNodes(buffer).forEach((sourceNode) => {
+            try {
+              sourceNode.disconnect();
+            } catch (_e) {
+              Logger.debugOnce(
+                "disposeEffectChain: restore routing disconnect failed",
+                {},
+                "disposeEffectChain.restoreRouting.disconnect"
+              );
+            }
+            try {
+              sourceNode.connect(buffer._gainNode);
+            } catch (_e) {
+              Logger.debugOnce(
+                "disposeEffectChain: restore routing connect failed",
+                {},
+                "disposeEffectChain.restoreRouting.connect"
+              );
+            }
+          });
         }
       } catch (_e) {
         Logger.debugOnce(

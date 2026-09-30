@@ -117,6 +117,10 @@
     MAX_RETRIES: 50,
     CACHE_KEY_DECIMALS: 6,
 
+    // Audio load watchdog (missing / corrupt files must not leave zombie tracks)
+    LOAD_TIMEOUT_MS: 30000,
+    LOAD_POLL_MS: 250,
+
     // Distance curve math
     SMOOTHSTEP_A: 3,
     SMOOTHSTEP_B: 2,
@@ -321,6 +325,209 @@
 
   // AudioEffects extracted to FugsAudio2Effects.js (Phase 3)
 
+  // =========================================================================
+  // Engine compatibility layer (RPG Maker MV 1.6.x and MZ 1.x)
+  // =========================================================================
+  // MV and MZ expose the same audio API surface this plugin needs, but their
+  // WebAudio internals differ. Everything version-specific lives HERE (and is
+  // exported as FugsAudio.engine) so the rest of the pack stays engine-agnostic.
+  //
+  //   MZ  AudioManager.createBuffer("bgm/", name)   folder WITH trailing slash
+  //       playing nodes: buffer._sourceNodes[]      (array; chunked decoding)
+  //       isPlaying():   flag set by play(), true even while still loading
+  //       pitch setter:  restarts playback from 0   (also true in MV)
+  //       destroy():     frees the buffer
+  //   MV  AudioManager.createBuffer("bgm", name)    folder WITHOUT trailing slash
+  //       playing node:  buffer._sourceNode
+  //       isPlaying():   "has a source node" -> false until decoded
+  //       BGM on Android Chrome goes through the shared Html5Audio element
+  const Engine = {
+    isMZ:
+      (typeof Utils !== "undefined" && Utils.RPGMAKER_NAME === "MZ") ||
+      (typeof PluginManager !== "undefined" && typeof PluginManager.registerCommand === "function"),
+
+    get name() {
+      return this.isMZ ? "MZ" : "MV";
+    },
+
+    /** Create an engine audio buffer for a track type ("bgm" | "bgs" | "me" | "se"). */
+    createBuffer(type, name) {
+      const folder = String(type).toLowerCase();
+      if (this.isMZ) return AudioManager.createBuffer(folder + "/", name);
+      // MV on Android Chrome plays BGM through ONE shared <audio> element (Html5Audio). That
+      // cannot host several independent tracks and would hijack the game's own BGM, so build
+      // a regular WebAudio buffer ourselves in that situation.
+      if (
+        folder === "bgm" &&
+        typeof AudioManager.shouldUseHtml5Audio === "function" &&
+        AudioManager.shouldUseHtml5Audio() &&
+        typeof WebAudio === "function"
+      ) {
+        const ext = typeof AudioManager.audioFileExt === "function" ? AudioManager.audioFileExt() : ".ogg";
+        return new WebAudio(AudioManager._path + folder + "/" + encodeURIComponent(name) + ext);
+      }
+      return AudioManager.createBuffer(folder, name);
+    },
+
+    /** Live AudioBufferSourceNodes of a buffer (MV: 0..1, MZ: 0..n chunks). */
+    sourceNodes(buffer) {
+      if (!buffer) return [];
+      if (Array.isArray(buffer._sourceNodes)) return buffer._sourceNodes.filter(Boolean);
+      return buffer._sourceNode ? [buffer._sourceNode] : [];
+    },
+
+    hasFailed(buffer) {
+      try {
+        return !!(buffer && typeof buffer.isError === "function" && buffer.isError());
+      } catch (_e) {
+        return false;
+      }
+    },
+
+    /** True while the audio file is still being fetched/decoded (and has not failed). */
+    isLoading(buffer) {
+      return (
+        !!buffer &&
+        typeof buffer.isReady === "function" &&
+        !buffer.isReady() &&
+        !this.hasFailed(buffer)
+      );
+    },
+
+    /**
+     * Change the playback speed of a live track WITHOUT restarting it.
+     * The engines' own `pitch` setter restarts playback from 0 (MV and MZ), which would
+     * make every pitch fade / doppler update / pitchbend re-trigger the song. Instead:
+     *  - ramp playbackRate on every live source node (no zipper noise),
+     *  - keep seek() exact by re-anchoring the buffer's start time,
+     *  - re-arm the engine's own end timer so one-shots follow the new speed.
+     */
+    setPlaybackRate(buffer, rate) {
+      if (!buffer) return;
+      const target = Math.max(0.1, Math.min(4, Number(rate) || 1));
+      const nodes = this.sourceNodes(buffer);
+      const context = typeof WebAudio !== "undefined" ? WebAudio._context : null;
+      const oldPitch = typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
+
+      if (!context || nodes.length === 0) {
+        // Not playing yet (still loading, or stopped): the engine reads _pitch when it creates
+        // the source nodes, so a plain write is exactly right and cannot restart anything.
+        buffer._pitch = target;
+        return;
+      }
+
+      const now = context.currentTime;
+      if (typeof buffer._startTime === "number" && oldPitch !== target) {
+        buffer._startTime = now - ((now - buffer._startTime) * oldPitch) / target;
+      }
+      buffer._pitch = target;
+
+      for (let i = 0; i < nodes.length; i++) {
+        const param = nodes[i].playbackRate;
+        if (!param) continue;
+        try {
+          param.cancelScheduledValues(now);
+          param.setTargetAtTime(target, now, 0.02);
+        } catch (_e) {
+          try {
+            param.value = target;
+          } catch (_err) {
+            /* ignore */
+          }
+        }
+      }
+
+      if (
+        buffer._endTimer &&
+        typeof buffer._removeEndTimer === "function" &&
+        typeof buffer._createEndTimer === "function"
+      ) {
+        buffer._removeEndTimer();
+        buffer._createEndTimer();
+      }
+    },
+
+    /**
+     * Route every current (and, on MZ, future) source node of `buffer` into `input`
+     * instead of the engine's default source -> gain connection.
+     * MZ re-creates source nodes when a streamed file finishes decoding; the hook keeps the
+     * routing correct across that.
+     */
+    routeSources(buffer, input) {
+      const nodes = this.sourceNodes(buffer);
+      for (let i = 0; i < nodes.length; i++) {
+        try {
+          nodes[i].disconnect();
+        } catch (_e) {
+          /* already disconnected */
+        }
+        nodes[i].connect(input);
+      }
+      if (
+        this.isMZ &&
+        typeof buffer._createSourceNode === "function" &&
+        !Object.prototype.hasOwnProperty.call(buffer, "_fugsRouteWrapped")
+      ) {
+        const original = buffer._createSourceNode;
+        buffer._fugsRouteWrapped = true;
+        buffer._createSourceNode = function (index) {
+          original.apply(this, arguments);
+          const created = this._sourceNodes && this._sourceNodes[index];
+          const target = this._fugsRouteInput;
+          if (created && target) {
+            try {
+              created.disconnect();
+              created.connect(target);
+            } catch (_e) {
+              /* leave the default routing in place */
+            }
+          }
+        };
+      }
+      buffer._fugsRouteInput = input;
+    },
+
+    /** Stop re-routing new MZ source nodes (effect chain removed). */
+    unrouteSources(buffer) {
+      if (buffer) buffer._fugsRouteInput = null;
+    },
+
+    /** Free an engine buffer for GC. Safe to call more than once. */
+    release(buffer) {
+      if (!buffer) return;
+      // MV: the decoded PCM data (the big memory consumer)
+      buffer._buffer = null;
+      // Disconnect every source node while we can still reach it (MZ can have several).
+      const nodes = this.sourceNodes(buffer);
+      for (let i = 0; i < nodes.length; i++) {
+        try {
+          nodes[i].disconnect();
+        } catch (_e) {
+          /* ok */
+        }
+      }
+      buffer._sourceNode = null;
+      ["_gainNode", "_pannerNode", "_pumpGainNode"].forEach((prop) => {
+        if (buffer[prop]) {
+          try {
+            buffer[prop].disconnect();
+          } catch (_e) {
+            /* ok */
+          }
+          buffer[prop] = null;
+        }
+      });
+      // MZ: destroy() releases the decoded chunks (_buffers[]) and the source-node array.
+      if (this.isMZ && typeof buffer.destroy === "function") {
+        try {
+          buffer.destroy();
+        } catch (_e) {
+          /* ok */
+        }
+      }
+    },
+  };
+
   // Performance-optimized fade system
   // Uses RAF for smooth updates with a setTimeout watchdog that kicks in
   // whenever RAF stalls (backgrounded tab, heavy GC, DevTools open, etc.).
@@ -483,6 +690,7 @@
     proximityData: new Map(),
     pausedTracks: new Set(),
     pausedSnapshots: new Map(), // Store paused track state for reliable resume
+    _scenePausedKeys: new Set(), // Tracks paused by a scene change ((pause:scene)) -> auto-resume
     effectChains: new Map(),
     panSweeps: new Map(),
     sidechainConnections: new Map(), // Track active sidechain compressors
@@ -491,6 +699,8 @@
     sfxAliases: new Map(), // SFX alias pool definitions
     aliasLastPlayed: new Map(), // Cooldown tracking for aliases
     pumpConfig: { active: false, bpm: 120, depth: 0, shape: "sine", tracks: "all", startTime: 0 },
+    // Engine (MV/MZ) compatibility layer shared with the satellites
+    engine: Engine,
     // Phase 2 extension contract
     config: typeof FugsAudioConfig !== "undefined" ? FugsAudioConfig : {},
     _handlers: new Map(),
@@ -1008,11 +1218,12 @@
 
         // Global commands
         // Global "all" commands
+        // pauseall / pauseall-[Type] and resumeall / resumeall-[Type]
         case "pauseall":
-          return this.pauseAll();
+          return this.pauseAll(type);
 
         case "resumeall":
-          return this.resumeAll();
+          return this.resumeAll(type);
 
         case "stopall":
           if (type === "all") {
@@ -1208,26 +1419,25 @@
         if (list.length === 0) this.activeTimeouts.delete(key);
       };
 
-      const schedule = () => {
-        if (this.tracks.get(key) !== buffer) return;
-        if (buffer._fugsManualStop) return;
+      let notReadyRetries = 0;
 
-        const totalTime = typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
-        const pitchNow =
-          typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
-
-        if (totalTime <= 0) {
-          const retryId = setTimeout(schedule, 200);
-          trackTimeout(retryId);
-          return;
-        }
-
-        const remaining = Math.max(0, totalTime - (offsetSeconds || 0));
-        const delayMs = Math.max(50, (remaining / pitchNow) * 1000 + 60);
+      const arm = (delayMs) => {
         const timeoutId = setTimeout(() => {
           removeTrackedTimeout(timeoutId);
           if (this.tracks.get(key) !== buffer) return;
           if (buffer._fugsManualStop) return;
+
+          // The pitch may have been lowered since this timer was armed (pitch fade, doppler,
+          // pitchbendall): only finish once the sound has REALLY ended, otherwise wait for
+          // the remaining time at the current speed.
+          const stillPlaying = typeof buffer.isPlaying === "function" && buffer.isPlaying();
+          if (stillPlaying) {
+            const wallLeftMs = this._remainingPlaybackMs(buffer);
+            if (wallLeftMs > 250) {
+              arm(wallLeftMs + 60);
+              return;
+            }
+          }
 
           if (
             typeof buffer._fugsLoopRepeatsRemaining === "number" &&
@@ -1250,6 +1460,27 @@
         trackTimeout(timeoutId);
       };
 
+      const schedule = () => {
+        if (this.tracks.get(key) !== buffer) return;
+        if (buffer._fugsManualStop) return;
+
+        const totalTime = typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
+        const pitchNow =
+          typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
+
+        if (totalTime <= 0) {
+          // Decoded but duration not known yet: retry briefly (bounded — _watchLoad reports
+          // buffers that never become playable).
+          if (++notReadyRetries > AUDIO_CONSTANTS.MAX_RETRIES) return;
+          const retryId = setTimeout(schedule, 200);
+          trackTimeout(retryId);
+          return;
+        }
+
+        const remaining = Math.max(0, totalTime - (offsetSeconds || 0));
+        arm(Math.max(50, (remaining / pitchNow) * 1000 + 60));
+      };
+
       if (
         typeof buffer.isReady === "function" &&
         !buffer.isReady() &&
@@ -1260,6 +1491,64 @@
       }
 
       schedule();
+    },
+
+    /** Wall-clock milliseconds of audio left in `buffer` at its current speed (0 if unknown). */
+    _remainingPlaybackMs(buffer) {
+      const total = buffer && typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
+      if (total <= 0) return 0;
+      const pitch = typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
+      let pos = 0;
+      try {
+        pos = typeof buffer.seek === "function" ? buffer.seek() : 0;
+      } catch (_e) {
+        pos = 0;
+      }
+      return Math.max(0, ((total - pos) / pitch) * 1000);
+    },
+
+    /**
+     * A file that never loads (typo, missing or corrupt file) must not leave a zombie track
+     * behind. Poll cheaply until the buffer is ready, and give up with a visible error when the
+     * engine flags the load as failed or it takes unreasonably long.
+     */
+    _watchLoad(key, buffer, type, name) {
+      if (!Engine.isLoading(buffer) && !Engine.hasFailed(buffer)) return;
+      const startedAt = performance.now();
+
+      const check = () => {
+        if (this.tracks.get(key) !== buffer) return; // stopped or replaced meanwhile
+        if (typeof buffer.isReady === "function" && buffer.isReady()) return; // loaded fine
+
+        const failed = Engine.hasFailed(buffer);
+        const timedOut = performance.now() - startedAt > AUDIO_CONSTANTS.LOAD_TIMEOUT_MS;
+        if (failed || timedOut) {
+          Logger.error(
+            `Could not load audio/${String(type).toLowerCase()}/${name} ` +
+              `(${failed ? "load error" : "timed out"}) - check the file name and that the file exists.`
+          );
+          buffer._fugsManualStop = true;
+          this._stopBufferSafely(buffer);
+          this.tracks.delete(key);
+          this.cleanupTrack(key);
+          this._releaseBuffer(buffer);
+          return;
+        }
+
+        const id = setTimeout(() => {
+          if (this.activeTimeouts.has(key)) {
+            const list = this.activeTimeouts.get(key);
+            const i = list.indexOf(id);
+            if (i > -1) list.splice(i, 1);
+            if (list.length === 0) this.activeTimeouts.delete(key);
+          }
+          check();
+        }, AUDIO_CONSTANTS.LOAD_POLL_MS);
+        if (!this.activeTimeouts.has(key)) this.activeTimeouts.set(key, []);
+        this.activeTimeouts.get(key).push(id);
+      };
+
+      check();
     },
 
     playAudio(options) {
@@ -1277,6 +1566,12 @@
         loop, // boolean | 'forever' | 'never' | number (repeat count)
         startTime = 0,
       } = options;
+
+      if (name === undefined || name === null || String(name).trim() === "") {
+        // Visible even at the default log level: "play-bgm1" with no file is always a mistake.
+        console.warn(`[FugsAudio] play-${type}${trackId}: no audio file name given`);
+        return false;
+      }
 
       const normalizeLoop = () => {
         // Default behavior when `loop` is omitted:
@@ -1327,7 +1622,7 @@
       }
 
       try {
-        const buffer = AudioManager.createBuffer(type.toLowerCase(), name);
+        const buffer = Engine.createBuffer(type, name);
 
         if (!buffer) {
           Logger.error(`Failed to create audio buffer for ${name}`);
@@ -1412,6 +1707,9 @@
           Logger.info(`${key}: Applying fade-in immediately`);
           applyFadeIn();
         }
+
+        // A file that never loads (typo, missing/corrupt file) must not leave a zombie track.
+        this._watchLoad(key, buffer, type, name);
 
         return true;
       } catch (error) {
@@ -1498,7 +1796,7 @@
         }
 
         try {
-          const buffer = AudioManager.createBuffer(type.toLowerCase(), name);
+          const buffer = Engine.createBuffer(type, name);
           if (!buffer) {
             Logger.error(`syncPlay: Failed to create buffer for ${name}`);
             continue;
@@ -2216,7 +2514,7 @@
         // Create new buffer (we have to because the old one was stopped)
         let newBuffer;
         try {
-          newBuffer = AudioManager.createBuffer(type.toLowerCase(), savedName);
+          newBuffer = Engine.createBuffer(type, savedName);
         } catch (bufferError) {
           Logger.error(`Exception creating buffer for ${savedName}: ${bufferError.message}`);
           return false;
@@ -2289,6 +2587,9 @@
           this._scheduleTrackEndAction(key, newBuffer, startPos);
         }
 
+        // Pause cancelled the old load watch too; keep guarding the recreated buffer.
+        this._watchLoad(key, newBuffer, type, savedName);
+
         // Apply fade-in if needed
         if (fadein > 0) {
           this.fadeAudio(type, trackId, {
@@ -2331,33 +2632,54 @@
       }
     },
 
-    pauseAll() {
+    /** Pause every track, or only one type ("bgm" | "bgs" | "me" | "se") — pauseall-[Type]. */
+    pauseAll(onlyType) {
       let count = 0;
-      for (const key of this.tracks.keys()) {
+      const filter = onlyType && onlyType !== "all" ? String(onlyType).toLowerCase() : null;
+      for (const key of Array.from(this.tracks.keys())) {
         if (typeof key !== "string" || key.indexOf("_") === -1) continue;
         const [type, trackId] = key.split("_");
+        if (filter && type !== filter) continue;
         if (this.pauseAudio(type, trackId, [])) {
           count++;
         }
       }
-      Logger.info(`Paused ${count} tracks`);
+      Logger.info(`Paused ${count} tracks${filter ? " (" + filter + ")" : ""}`);
       return count;
     },
 
-    resumeAll() {
+    /** Resume every paused track, or only one type — resumeall-[Type]. */
+    resumeAll(onlyType) {
       let count = 0;
+      const filter = onlyType && onlyType !== "all" ? String(onlyType).toLowerCase() : null;
       // Clone the Set to avoid modification during iteration
       // (resumeAudio deletes from pausedTracks)
       const tracksToResume = Array.from(this.pausedTracks);
       for (const key of tracksToResume) {
         if (typeof key !== "string" || key.indexOf("_") === -1) continue;
         const [type, trackId] = key.split("_");
+        if (filter && type !== filter) continue;
         if (this.resumeAudio(type, trackId, [])) {
           count++;
         }
       }
-      Logger.info(`Resumed ${count} tracks`);
+      Logger.info(`Resumed ${count} tracks${filter ? " (" + filter + ")" : ""}`);
       return count;
+    },
+
+    /**
+     * Resume tracks that a SCENE CHANGE paused ((pause:scene) / Default Pause Mode "scene").
+     * Called when the next map scene is created. Tracks the user paused by hand are not touched.
+     */
+    resumeScenePaused() {
+      const keys = Array.from(this._scenePausedKeys);
+      this._scenePausedKeys.clear();
+      for (const key of keys) {
+        if (!this.pausedTracks.has(key)) continue;
+        const [type, trackId] = key.split("_");
+        this.resumeAudio(type, trackId, []);
+        Logger.info(`Resumed ${key} after scene change`);
+      }
     },
     connectEffectChain(_key, _buffer) {
       console.warn("[FugsAudio] connectEffectChain requires FugsAudio2Effects");
@@ -2412,36 +2734,10 @@
       const dopplerPitch = buffer._dopplerPitch || 1.0;
       const targetPitch = Math.max(0.1, Math.min(4, basePitch * dopplerPitch));
 
-      // Use AudioParam ramp when possible to avoid zipper/buzz artifacts
-      if (
-        typeof WebAudio !== "undefined" &&
-        WebAudio._context &&
-        buffer._sourceNode &&
-        buffer._sourceNode.playbackRate
-      ) {
-        const param = buffer._sourceNode.playbackRate;
-        const now = WebAudio._context.currentTime;
-        try {
-          param.cancelScheduledValues(now);
-          param.setTargetAtTime(targetPitch, now, 0.02);
-        } catch (_e) {
-          try {
-            param.value = targetPitch;
-          } catch (_err) {
-            // Dev-only diagnostics (log once per buffer to avoid spam)
-            if (!buffer._fugsLoggedPitchError) {
-              buffer._fugsLoggedPitchError = true;
-              Logger.debug("updateTrackPitch: failed to set playbackRate; continuing", {
-                name: buffer._name,
-                targetPitch,
-              });
-            }
-          }
-        }
-        buffer._pitch = targetPitch;
-      } else {
-        buffer.pitch = targetPitch;
-      }
+      // Never use the engine's `pitch` setter on a playing track: in MV AND MZ it restarts the
+      // sound from 0. Engine.setPlaybackRate ramps playbackRate on every live source node (MV:
+      // one, MZ: an array), keeps seek() accurate and re-arms the engine's end timer.
+      Engine.setPlaybackRate(buffer, targetPitch);
     },
 
     updateProximityVolume() {
@@ -2490,6 +2786,7 @@
       this.proximityData.delete(key);
       this.pausedTracks.delete(key);
       this.pausedSnapshots.delete(key);
+      this._scenePausedKeys.delete(key);
 
       // Clear proximity error tracking for this key
       // Create new Set excluding matching keys to avoid iterator invalidation
@@ -2527,42 +2824,9 @@
     },
 
     _releaseBuffer(buffer) {
-      if (!buffer) return;
-      // Null the decoded PCM data (the big memory consumer)
-      buffer._buffer = null;
-      // Disconnect and null WebAudio nodes
-      if (buffer._sourceNode) {
-        try {
-          buffer._sourceNode.disconnect();
-        } catch (_e) {
-          /* ok */
-        }
-        buffer._sourceNode = null;
-      }
-      if (buffer._gainNode) {
-        try {
-          buffer._gainNode.disconnect();
-        } catch (_e) {
-          /* ok */
-        }
-        buffer._gainNode = null;
-      }
-      if (buffer._pannerNode) {
-        try {
-          buffer._pannerNode.disconnect();
-        } catch (_e) {
-          /* ok */
-        }
-        buffer._pannerNode = null;
-      }
-      if (buffer._pumpGainNode) {
-        try {
-          buffer._pumpGainNode.disconnect();
-        } catch (_e) {
-          /* ok */
-        }
-        buffer._pumpGainNode = null;
-      }
+      // MV: nulls the decoded PCM + nodes. MZ: also destroy()s the buffer (chunked _buffers[],
+      // _sourceNodes[]), which MV-style field nulling alone would leave in memory.
+      Engine.release(buffer);
     },
 
     // Save/Resume system
@@ -3058,6 +3322,103 @@
       return args;
     },
 
+    // ---------------------------------------------------------------------
+    // Plugin command entry points (shared by MV and MZ)
+    //   MV  event "Plugin Command"      -> Game_Interpreter.pluginCommand(command, args)
+    //   MZ  event "Plugin Command (MV)" -> command356(params) -> pluginCommand(command, args)
+    //   MZ  event "Plugin Command"      -> PluginManager.registerCommand(...) "run"/"runMultiple"
+    // ---------------------------------------------------------------------
+
+    /**
+     * Run a command that is already split into (command, args).
+     * opts.strict (MZ native command): warn about commands this pack does not know, instead of
+     * ignoring them — in MV every plugin's commands pass through pluginCommand(), so the
+     * legacy path must stay silent for foreign commands.
+     */
+    runPluginCommand(command, args, opts) {
+      const strict = !!(opts && opts.strict);
+      if (strict && !this.isKnownPluginCommand(String(command || "").toLowerCase())) {
+        console.warn(`[FugsAudio] Unknown command "${command}"`);
+        return false;
+      }
+
+      const parsed = this.parseCommand(command, args);
+      if (!parsed) {
+        if (strict) {
+          console.warn(`[FugsAudio] Could not understand command: ${command} ${(args || []).join(" ")}`);
+        }
+        return false;
+      }
+
+      const commandObj = {
+        type: parsed.type,
+        trackId: parsed.trackId,
+        action: parsed.action,
+        args: parsed.args,
+        loop: parsed.loop,
+        effect: parsed.effect,
+        persistence: parsed.persistence,
+        pauseMode: parsed.pauseMode,
+        switchId: parsed.switchId,
+        curve: parsed.curve,
+        startTime: parsed.startTime,
+      };
+
+      if (parsed.switchId) {
+        // Switch plugin (or Core SwitchBuffer) via onSwitchGatedCommand
+        const handlers = this._switchGatedHandlers || [];
+        let handled = false;
+        for (let i = 0; i < handlers.length; i++) {
+          try {
+            if (handlers[i].call(this, parsed.switchId, commandObj)) {
+              handled = true;
+              break;
+            }
+          } catch (e) {
+            Logger.error("onSwitchGatedCommand failed", {
+              error: e && e.message ? e.message : e,
+            });
+          }
+        }
+        if (!handled) {
+          Logger.warn(
+            "switch:" + parsed.switchId + " present but no switch handler — executing immediately"
+          );
+          return this.executeCommand(commandObj);
+        }
+        return true;
+      }
+      return this.executeCommand(commandObj);
+    },
+
+    /**
+     * Run a command string exactly like a classic plugin command ("play-bgm1 Theme 90 2").
+     * Several commands may be given, one per line; blank lines and lines starting with
+     * "//" or "#" are ignored. Quotes keep names with spaces together.
+     */
+    runCommandText(text) {
+      const lines = String(text === undefined || text === null ? "" : text).split(/\r?\n/);
+      let ok = true;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line || line.startsWith("//") || line.startsWith("#")) continue;
+        const parts = this.parseArguments(line);
+        if (parts.length === 0) continue;
+        if (this.runPluginCommand(parts[0], parts.slice(1), { strict: true }) === false) ok = false;
+      }
+      return ok;
+    },
+
+    /** Raw text of the plugin command an interpreter is executing (MV: _params, MZ: command356 params). */
+    _rawCommandText(interpreter) {
+      if (!interpreter) return "";
+      const p =
+        interpreter._params && interpreter._params[0]
+          ? interpreter._params
+          : interpreter._fugsCommand356Params;
+      return p && typeof p[0] === "string" ? p[0] : "";
+    },
+
     // Scene transition handling
     handleSceneTransition(transitionType, fadeoutDuration = SceneFadeoutTime) {
       Logger.info(`Handling ${transitionType} transition with ${fadeoutDuration}s fadeout`);
@@ -3113,7 +3474,10 @@
         // Pause takes priority over stop - if pause mode says to pause, do that instead
         if (shouldPause) {
           const [type, trackId] = key.split("_");
+          const wasPaused = this.pausedTracks.has(key);
           this.pauseAudio(type, trackId, [fadeoutDuration]);
+          // Remember scene-change pauses so the next map scene can bring them back.
+          if (transitionType === "scene" && !wasPaused) this._scenePausedKeys.add(key);
         } else if (shouldStop) {
           const [type, trackId] = key.split("_");
 
@@ -3133,11 +3497,16 @@
           // Safer check: buffer exists and either has no isPlaying method (assume valid)
           // or isPlaying returns true, or track is paused
           const isPaused = this.pausedTracks.has(key) || this.pausedSnapshots.has(key);
+          // A buffer that is still loading is NOT dead. MV's isPlaying() means "has a source
+          // node", which does not exist until the file is decoded — so a track that was
+          // just (re)created, e.g. resumed after a battle, would otherwise be reaped here
+          // in the same tick. (MZ sets its isPlaying flag immediately, MV does not.)
           const isPlayingCheck =
             buffer &&
             (typeof buffer.isPlaying !== "function" || // No method = assume valid
               buffer.isPlaying() ||
-              isPaused);
+              isPaused ||
+              Engine.isLoading(buffer));
 
           if (buffer && isPlayingCheck) {
             validTracks.set(key, buffer);
@@ -3888,13 +4257,29 @@
     const _DataManager_loadGame = DataManager.loadGame;
     DataManager.loadGame = function (savefileId) {
       const result = _DataManager_loadGame.call(this, savefileId);
-      if (result) {
+
+      const onLoaded = () => {
         FugsMultiTrackAudioEX.handleSceneTransition("scene", SceneFadeoutTime);
         // Use fallback delay for load game (scene may not be fully initialized yet)
         setTimeout(() => {
           FugsMultiTrackAudioEX.loadAllStates("auto");
         }, sceneTransitionDelayMS);
+      };
+
+      // MZ: loadGame() is asynchronous and returns a Promise; the save contents (including
+      // contents.fugsAudio) are only extracted once it resolves. Restoring earlier would replay
+      // a stale "auto" snapshot. MV: synchronous, returns true/false.
+      if (result && typeof result.then === "function") {
+        return result.then((value) => {
+          try {
+            onLoaded();
+          } catch (e) {
+            Logger.error("Audio restore after load failed", { error: e && e.message ? e.message : e });
+          }
+          return value;
+        });
       }
+      if (result) onLoaded();
       return result;
     };
 
@@ -3913,6 +4298,8 @@
       // Reset position trackers to force proximity update on first frame
       FugsMultiTrackAudioEX.lastPlayerX = null;
       FugsMultiTrackAudioEX.lastPlayerY = null;
+      // (pause:scene) tracks were paused by the scene change that led here: bring them back.
+      FugsMultiTrackAudioEX.resumeScenePaused();
     };
 
     const _Scene_Map_update = Scene_Map.prototype.update;
@@ -4012,14 +4399,16 @@
       }
     };
 
-    // Plugin Command Handler
+    // ---- Plugin command entry points --------------------------------------
+    // (1) MV "Plugin Command" and MZ "Plugin Command (MV)" (imported MV projects): both end up
+    //     in Game_Interpreter.pluginCommand(command, args), where args are merely space-split.
     const _Game_Interpreter_pluginCommand = Game_Interpreter.prototype.pluginCommand;
     Game_Interpreter.prototype.pluginCommand = function (command, args) {
       _Game_Interpreter_pluginCommand.call(this, command, args);
 
-      // For FugsMultiTrackAudioEX commands, re-parse from raw params to handle quotes
-      if (this._params && this._params[0]) {
-        const rawCommand = this._params[0];
+      // For FugsMultiTrackAudioEX commands, re-parse from the raw text to handle quotes
+      const rawCommand = FugsMultiTrackAudioEX._rawCommandText(this);
+      if (rawCommand) {
         const allParts = FugsMultiTrackAudioEX.parseArguments(rawCommand);
         if (allParts.length > 0) {
           const cmdName = allParts[0].toLowerCase();
@@ -4031,51 +4420,48 @@
         }
       }
 
-      const parsed = FugsMultiTrackAudioEX.parseCommand(command, args);
-      if (!parsed) return;
-
-      const commandObj = {
-        type: parsed.type,
-        trackId: parsed.trackId,
-        action: parsed.action,
-        args: parsed.args,
-        loop: parsed.loop,
-        effect: parsed.effect,
-        persistence: parsed.persistence,
-        pauseMode: parsed.pauseMode,
-        switchId: parsed.switchId,
-        curve: parsed.curve,
-        startTime: parsed.startTime,
-      };
-
-      if (parsed.switchId) {
-        // Switch plugin (or Core SwitchBuffer) via onSwitchGatedCommand
-        const handlers = FugsMultiTrackAudioEX._switchGatedHandlers || [];
-        let handled = false;
-        for (let i = 0; i < handlers.length; i++) {
-          try {
-            if (handlers[i].call(FugsMultiTrackAudioEX, parsed.switchId, commandObj)) {
-              handled = true;
-              break;
-            }
-          } catch (e) {
-            Logger.error("onSwitchGatedCommand failed", {
-              error: e && e.message ? e.message : e,
-            });
-          }
-        }
-        if (!handled) {
-          Logger.warn(
-            "switch:" +
-              parsed.switchId +
-              " present but no switch handler — executing immediately"
-          );
-          FugsMultiTrackAudioEX.executeCommand(commandObj);
-        }
-        return;
-      }
-      FugsMultiTrackAudioEX.executeCommand(commandObj);
+      FugsMultiTrackAudioEX.runPluginCommand(command, args);
     };
+
+    if (Engine.isMZ && typeof Game_Interpreter.prototype.command356 === "function") {
+      // MZ passes an event command's parameters INTO command356(params); unlike MV there is
+      // no this._params. Remember them so pluginCommand() can see the raw, quoted text.
+      const _Game_Interpreter_command356 = Game_Interpreter.prototype.command356;
+      Game_Interpreter.prototype.command356 = function (params) {
+        this._fugsCommand356Params = params;
+        try {
+          return _Game_Interpreter_command356.apply(this, arguments);
+        } finally {
+          this._fugsCommand356Params = null;
+        }
+      };
+    }
+
+    // (2) MZ native "Plugin Command": declared with @command in the plugin header. The engine
+    //     looks a command up by the plugin FILE name, so register under the name this file was
+    //     actually loaded as (users rename plugins), plus the default names.
+    if (Engine.isMZ && typeof PluginManager.registerCommand === "function") {
+      const fileNames = ["FugsMultiTrackAudioEX", "FugsAudio1Core"];
+      const src = typeof document !== "undefined" && document.currentScript && document.currentScript.src;
+      if (src) {
+        let file = String(src).split("?")[0].split("/").pop() || "";
+        try {
+          file = decodeURIComponent(file);
+        } catch (_e) {
+          /* keep raw */
+        }
+        file = file.replace(/\.js$/i, "");
+        if (file && fileNames.indexOf(file) === -1) fileNames.unshift(file);
+      }
+      fileNames.forEach((pluginName) => {
+        PluginManager.registerCommand(pluginName, "run", function (args) {
+          FugsMultiTrackAudioEX.runCommandText(args && args.command);
+        });
+        PluginManager.registerCommand(pluginName, "runMultiple", function (args) {
+          FugsMultiTrackAudioEX.runCommandText(args && args.commands);
+        });
+      });
+    }
 
     // TestRunner extracted to FugsAudio8Test.js (Phase 1)
   } // end _fugsAudioHooked else
