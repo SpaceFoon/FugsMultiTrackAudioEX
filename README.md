@@ -123,6 +123,7 @@ Script API:
 FugsAudio.play({ type: "bgm", trackId: 1, name: "ThemeA", volume: 90, fadein: 2 });
 FugsAudio.fade("bgm", 1, { volume: 0, duration: 2 });
 FugsAudio.stop("bgm", 1, 1);
+FugsAudio.play("bgm", 1, "ThemeA", { volume: 90, fadein: 2 }); // positional form (as in the Docs plugin) works too
 ```
 
 Full playbook: enable `FugsAudio0Docs` and open it in Plugin Manager.
@@ -143,10 +144,11 @@ Full playbook: enable `FugsAudio0Docs` and open it in Plugin Manager.
 With `FugsAudio8Test` enabled, open the game console (F8):
 
 ```javascript
-test("?")           // list tests
-test("play")        // run play-* tests
-await test("*")     // full suite (robot mode)
-test.mode = "human" // longer waits so you can listen
+test("?")              // list tests
+test("play")           // run every play / play:* test
+test("preset:cave")    // one test by name, with a parameter (a single preset)
+await test("*")        // full suite (robot mode)
+test.mode = "human"    // longer waits so you can listen
 ```
 
 The in-game suite runs on MV and MZ (NW.js). It needs Node integration (`require`) for its audio-folder scan, so it is meant for desktop playtests, not web builds.
@@ -169,7 +171,7 @@ node --test scripts/tests/*.test.js       # engine scenarios on the MV and MZ mo
 
 The mocks the first smoke tests used were too loose to see engine differences, so there is a proper harness: a deterministic virtual clock (timers, animation frames, `performance.now`, `AudioContext.currentTime`), a strict fake Web Audio graph (real `connect`/`disconnect` rules, `AudioParam` automation, playback-position integration), and engine backends that the whole pack is loaded into exactly as a game does (plugins first, audio context afterwards). Assertions look at the audio graph, i.e. what a listener would hear — not at the plugin's own bookkeeping.
 
-About 160–170 scenarios per backend cover boot, every command family, play/pause/resume/stop and end-of-track cleanup, pitch/seek accuracy, scene/battle/menu persistence and pause policies, save/load (including MZ's Promise-based `DataManager`), effects and presets, proximity/doppler/pan sweep, duck/pump/sidechain, switches, aliases, OcRam compat, missing files, MZ chunked streaming over http, MV on Android Chrome, disabled audio — and the shipped in-game `test()` suite itself.
+About 170 scenarios per backend cover boot, every command family, play/pause/resume/stop and end-of-track cleanup, pitch/seek accuracy, scene/battle/menu persistence and pause policies, save/load (including MZ's Promise-based `DataManager`), effects and presets, proximity/doppler/pan sweep, duck/pump/sidechain, switches, aliases, OcRam compat, missing files, MZ chunked streaming over http, MV on Android Chrome, disabled audio. Two further checks keep the documentation honest: every example in this README's Quick start runs verbatim, and every concrete command and `FugsAudio.*` example in the `FugsAudio0Docs` playbook is extracted from its text and executed. The shipped in-game `test()` suite runs on every backend too.
 
 | Backend | How it is built | Selected by |
 |---------|-----------------|-------------|
@@ -206,7 +208,7 @@ Command syntax and `contents.fugsAudio` save data are unchanged.
 ## Docs in this repo
 
 - [`docs/MULTI_PLUGIN_SPLIT_PLAN.md`](docs/MULTI_PLUGIN_SPLIT_PLAN.md) — split architecture and phases
-- [`docs/BUGS.md`](docs/BUGS.md) — defects found and fixed (B01–B16 code review, B17–B34 MV/MZ compatibility audit)
+- [`docs/BUGS.md`](docs/BUGS.md) — defects found and fixed (B01–B16 code review, B17–B36 MV/MZ compatibility audit)
 - [`scripts/verify-all.js`](scripts/verify-all.js) — offline verification gate
 - [`dist/FugsMultiTrackAudioEX.bundle.js`](dist/FugsMultiTrackAudioEX.bundle.js) — generated all-in-one plugin
 - `FugsAudio0Docs.js` — full in-Plugin-Manager playbook

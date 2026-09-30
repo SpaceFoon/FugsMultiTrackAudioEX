@@ -107,6 +107,9 @@
  *
  * Parsing notes:
  *   - Filenames with spaces should be quoted: "Battle Theme".
+ *   - A {config} (proximity, registeralias, ...) is typed on ONE line; this
+ *     document only wraps long ones to fit. (MZ "Run Commands (one per line)"
+ *     also accepts a config that continues on the following lines.)
  *   - Optional tags:
  *       (p:none|scene|battle|always)
  *       (pause:never|menu|battle|scene)
@@ -529,6 +532,8 @@
  *
  * QUICK COMMANDS:
  *   FugsAudio.testCommand('play-bgm1 Battle1 90')  // Test any command
+ *   FugsAudio.runCommandText('play-bgm1 ThemeSong 90 2')  // Same text as a Plugin Command
+ *                                   // (several commands: one per line; works in Script calls)
  *   FugsAudio.list()                // Show all active tracks
  *   FugsAudio.stopAll(0)            // Stop everything
  *

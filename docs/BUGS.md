@@ -8,7 +8,7 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 
 > **Status (2026-08-09):** All 16 confirmed bugs (B01–B16) are fixed. Each was verified with isolated Node smoke tests simulating the RPG Maker MV audio environment. Fixes span the core (`FugsMultiTrackAudioEX.js`) and the `FugsAudio2Effects` / `FugsAudio3Spatial` / `FugsAudio4Dynamics` satellites.
 
-> **Status (2026-09-30, v2.3):** A compatibility audit against engine models (MV 1.6, MZ 1.x) and the real MZ 1.7.0 scripts found 18 further defects (B17–B34): 6 that made the pack unusable or badly broken on **MZ** (before the fixes only 10 of 137 scenarios passed there), and 12 that hit **MV** (and MZ) — the original code passed 113 of 131 on the MV model. All are fixed and covered by the scenarios in `scripts/tests/` (see [README → Verification](../README.md#verification)). The earlier smoke tests could not see them: their `AudioManager`/`WebAudio` stubs ignored the folder argument, had no source nodes, and made `isPlaying()` synchronous.
+> **Status (2026-09-30, v2.3):** A compatibility audit against engine models (MV 1.6, MZ 1.x) and the real MZ 1.7.0 scripts found 20 further defects (B17–B36): 6 that made the pack unusable or badly broken on **MZ** (before the fixes only 10 of 137 scenarios passed there), and 14 that hit **MV** (and MZ) — the original code passed 113 of 131 on the MV model. All are fixed and covered by the scenarios in `scripts/tests/` (see [README → Verification](../README.md#verification)). The earlier smoke tests could not see them: their `AudioManager`/`WebAudio` stubs ignored the folder argument, had no source nodes, and made `isPlaying()` synchronous.
 
 ---
 
@@ -50,6 +50,8 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 | B32 | High | Returning from a battle is treated as a map change | **Fixed** |
 | B33 | Low | Alias `cooldown` swallows the first play shortly after startup | **Fixed** |
 | B34 | Low | Core parameters ignored when the Core is renamed or the bundle is used under its own name | **Fixed** |
+| B35 | Medium | README's `FugsAudio.play({ type, trackId, name, … })` example played nothing | **Fixed** |
+| B36 | Low | Dev test runner: `test.mode = "human"` did nothing; `test('preset:cave')`, `test('fade:curve:smooth')` and every listed `a:b` name ran the whole group | **Fixed** |
 
 ---
 
@@ -61,7 +63,7 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 
 **What was wrong:** Default `pauseMode: battle` paused tracks on battle enter, but battle exit never resumed them.
 
-**Fix:** Battle→map terminate now resumes `_pauseMode === "battle"` tracks (mirrors menu), then runs `handleSceneTransition("scene")`.
+**Fix:** Battle→map terminate now resumes `_pauseMode === "battle"` tracks (mirrors menu), then runs `handleSceneTransition("scene")`. *(Since B32 the battle→map hand-off uses its own `"afterBattle"` transition instead of `"scene"`.)*
 
 ---
 
@@ -465,9 +467,33 @@ Found with the engine harness (`scripts/harness`, scenarios in `scripts/tests`).
 
 ---
 
+#### B35 — Medium: README's `FugsAudio.play({ type, trackId, name, … })` example played nothing — **FIXED 2026-09-30**
+
+**Where:** `FugsAudio.play` (script API), README "Quick start"
+
+**What was wrong:** The README's Script API block called `play` with ONE object. `play` only understood the positional form the Docs plugin documents (`play(type, trackId, name, options)`), took the object for the *type*, and logged `play-[object Object]1: no audio file name given` — nothing played, on both engines.
+
+**Fix:** `play` also accepts the single-object form; the positional form is unchanged.
+
+**Covered by:** `09-readme-quickstart` — every README quick-start example now runs verbatim on every backend and is checked on the audio graph.
+
+---
+
+#### B36 — Low: Dev test runner — `test.mode` inert, `test('name:param')` runs the whole group — **FIXED 2026-09-30**
+
+**Where:** `FugsAudio8Test.js` (`window.test`, `TestRunner.run`)
+
+**What was wrong:** (a) README/Docs say `test.mode = "human"`; `window.test` is a function and the runner reads `TestRunner.mode`, so the assignment silently did nothing. (b) Any pattern with a colon was split into *group + parameters*: `test('preset:cave')` ("single preset", per the runner's own help) ran **all** `preset:*` tests (500+ checks), `test('fade:curve:smooth')` ran every `fade:*` test, and `test('unit:parse')` — a name copied from `test('?')` — ran every unit test.
+
+**Fix:** `test.mode` is an accessor for `TestRunner.mode`. With a colon, the registered test named by the longest prefix runs, and the rest are its parameters (`preset` + `cave`, `fade:curve` + `smooth`, `unit:parse` alone). A bare group name (`test('play')`) still runs the group.
+
+**Covered by:** `08-dev-test-runner`
+
+---
+
 ### Documentation corrected (in `FugsAudio0Docs.js`)
 
-MZ quick-start and the `Run Command` note; the `(loop:N)` / `(curve:name)` tags; the `madness` preset; sidechain arguments by number or file name; proximity updates every frame; transitions do not use snapshots; pause and battle-return semantics; the Options-menu volume note; the missing-file console message.
+MZ quick-start and the `Run Command` note; a `{config}` is typed on one line (MZ's multi-line command box also accepts one that wraps — `runCommandText` joins it); the `(loop:N)` / `(curve:name)` tags; the `madness` preset; sidechain arguments by number or file name; proximity updates every frame; transitions do not use snapshots; pause and battle-return semantics; the Options-menu volume note; the missing-file console message.
 
 ### Still open (engine-level, by design or out of scope)
 
@@ -500,7 +526,7 @@ These look wrong or fragile but need runtime confirmation or sharper repros befo
 |------|----------|
 | 2026-07-16 | Initial pass: playback, fades, pause/resume, scene/battle hooks, switches, effects, sidechain, save/load, command parsing |
 | 2026-07-16 | Second pass: proximity, sidechain timing/leaks, save/load spatial state, bulk fade/duck consistency, gameover/alias risks |
-| 2026-09-30 | Compatibility audit for RPG Maker MV 1.6 and MZ 1.x: engine harness + ~170 scenarios per backend, real MZ 1.7.0 scripts, Chromium 65 syntax/API scan → B17–B34 |
+| 2026-09-30 | Compatibility audit for RPG Maker MV 1.6 and MZ 1.x: engine harness + ~170 scenarios per backend, real MZ 1.7.0 scripts, Chromium 65 syntax/API scan → B17–B36 |
 
 ---
 

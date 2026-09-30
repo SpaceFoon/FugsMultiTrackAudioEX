@@ -62,6 +62,49 @@ forEachBackend("Dev test runner (FugsAudio8Test)", (b) => {
     });
   }
 
+  it("test.mode is the same switch as TestRunner.mode (README: test.mode = \"human\")", async () => {
+    const env = await boot(b, { pack: PACK });
+    assert.equal(env.run("test.mode"), "robot");
+    assert.equal(env.run("TestRunner.t"), 0.25);
+    env.run('test.mode = "human"');
+    assert.equal(env.run("TestRunner.mode"), "human");
+    assert.equal(env.run("TestRunner.t"), 1, "human mode waits for full length");
+    env.run('test.mode = "robot"');
+    assert.equal(env.run("TestRunner.t"), 0.25);
+  });
+
+  it("test('name:param') runs exactly that test with the parameter; a bare group name still runs the group", async () => {
+    const env = await boot(b, { pack: PACK });
+    const run = async (pattern) => {
+      const before = env.logs.all.length;
+      const result = await runInGameTests(env, pattern, { exclude: NEEDS_REAL_AUDIO });
+      const header = env.logs.all.slice(before).find((l) => /Running \d+ test/.test(l));
+      assert.ok(header, `no "Running N test(s)" line for ${pattern}`);
+      return { count: Number(/Running (\d+) test/.exec(header)[1]), log: env.logs.all.slice(before).join("\n"), result };
+    };
+
+    let r = await run("preset:cave"); // Docs: "Single preset by name"
+    assert.equal(r.count, 1);
+    assert.match(r.log, /cave applied/);
+    assert.doesNotMatch(r.log, /All \d+ presets applied/, "the other preset tests were not dragged in");
+    assert.equal(r.result.failed, 0);
+
+    r = await run("fade:curve:smooth"); // test('?') lists fade:curve; the last part is its parameter
+    assert.equal(r.count, 1);
+    assert.equal(r.result.failed, 0);
+
+    r = await run("playall:bgm"); // a listed name runs just that test
+    assert.equal(r.count, 1);
+
+    r = await run("unit:parse");
+    assert.equal(r.count, 1);
+    assert.ok(r.result.passed > 3 && r.result.failed === 0);
+
+    r = await run("play"); // bare group name: play, play:multi, play:types, play:fadein
+    assert.ok(r.count >= 4, "group run picks up the play:* tests too, got " + r.count);
+    assert.equal(r.result.failed, 0);
+  });
+
   it("cleanup() frees every track buffer on this engine (no leaked nodes or decoded data)", async () => {
     const env = await boot(b, { pack: PACK });
     await env.runCommand("play-bgm1 Theme 90");

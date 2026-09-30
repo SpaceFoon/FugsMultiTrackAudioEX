@@ -836,13 +836,35 @@ const TestRunner = {
     // Parse pattern: "name:param:subparam"
     const parts = pattern.split(":");
     const testName = parts[0];
-    const params = parts.slice(1);
+    let params = parts.slice(1);
+
+    // With a colon, the registered test named by the LONGEST prefix wins and the rest are its
+    // parameters, exactly as test() prints it:
+    //   test('preset:cave')        -> test "preset" with ["cave"]
+    //   test('fade:curve:smooth')  -> test "fade:curve" with ["smooth"]
+    //   test('unit:parse')         -> just that test
+    // A bare group name such as test('play') still runs every 'play' and 'play:*' test.
+    let exact = null;
+    if (parts.length > 1) {
+      for (let n = parts.length; n >= 1; n--) {
+        const candidate = parts.slice(0, n).join(":");
+        if (this.tests.has(candidate)) {
+          exact = candidate;
+          params = parts.slice(n);
+          break;
+        }
+      }
+    }
 
     // Find matching tests
     const matches = [];
-    for (const [name] of this.tests) {
-      if (name === testName || name.startsWith(testName + ":")) {
-        matches.push(name);
+    if (exact) {
+      matches.push(exact);
+    } else {
+      for (const [name] of this.tests) {
+        if (name === testName || name.startsWith(testName + ":")) {
+          matches.push(name);
+        }
       }
     }
 
@@ -1064,8 +1086,8 @@ const TestRunner = {
 ⚠️  IMPORTANT: Start a New Game or Load a save before running tests!
 
 Mode: ${this.mode.toUpperCase()} (${this.mode === "human" ? "slow, for listening" : "fast, automated"})
-  TestRunner.mode = 'human'   Slow tests for human ears
-  TestRunner.mode = 'robot'   Fast automated tests
+  test.mode = 'human'         Slow tests for human ears  (same as TestRunner.mode)
+  test.mode = 'robot'         Fast automated tests
 
 Usage:
   test('?')                 List all tests
@@ -1074,6 +1096,7 @@ Usage:
   test('preset')            Run preset test with ALL presets
   test('preset:cave')       Run preset test with just 'cave'
   test('fade:curve:smooth') Run fade:curve with just smooth curve
+  test('unit:parse')        Run one test by its full name (see test('?'))
   test('listen')            Run quick human listening smoke suite
   test('minimal')           Run minimal regression suite (recommended)
   test('*')                 Run ALL tests
@@ -5296,6 +5319,14 @@ TestRunner.add("coverage", async function () {
 // GLOBAL TEST FUNCTION
 // =====================================================================
 window.test = (pattern) => TestRunner.run(pattern);
+// README: `test.mode = "human"` is the same switch as `TestRunner.mode = "human"`.
+Object.defineProperty(window.test, "mode", {
+  get: () => TestRunner.mode,
+  set: (value) => {
+    TestRunner.mode = value;
+  },
+  enumerable: true,
+});
 window.TestRunner = TestRunner;
 
 Logger.info("Test runner loaded. Run: test() for help");

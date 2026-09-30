@@ -3446,14 +3446,24 @@
     /**
      * Run a command string exactly like a classic plugin command ("play-bgm1 Theme 90 2").
      * Several commands may be given, one per line; blank lines and lines starting with
-     * "//" or "#" are ignored. Quotes keep names with spaces together.
+     * "//" or "#" are ignored. Quotes keep names with spaces together; a {config} may wrap.
      */
     runCommandText(text) {
       const lines = String(text === undefined || text === null ? "" : text).split(/\r?\n/);
       let ok = true;
       for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
+        let line = lines[i].trim();
         if (!line || line.startsWith("//") || line.startsWith("#")) continue;
+        // A {config} wrapped over several lines (the Docs print long ones that way) is still ONE
+        // command: keep appending lines until the braces balance, but never swallow a line that
+        // starts the next command.
+        while (i + 1 < lines.length && line.split("{").length > line.split("}").length) {
+          const next = lines[i + 1].trim();
+          const nextWord = (next.split(/\s+/)[0] || "").toLowerCase();
+          if (next && this.isKnownPluginCommand(nextWord)) break;
+          line += " " + next;
+          i++;
+        }
         const parts = this.parseArguments(line);
         if (parts.length === 0) continue;
         if (this.runPluginCommand(parts[0], parts.slice(1), { strict: true }) === false) ok = false;
@@ -3922,7 +3932,8 @@
 
     /**
      * Play audio on a track.
-     * @param {string} type - 'bgm', 'bgs', 'me', or 'se'
+     * @param {string|object} type - 'bgm', 'bgs', 'me', or 'se' (or a single object holding
+     *   { type, trackId, name, ...the options below })
      * @param {number|string} trackId - Track number (default 1)
      * @param {string} name - Audio filename (without extension)
      * @param {object} options - Optional parameters
@@ -3941,6 +3952,11 @@
      * @returns {boolean} Success
      */
     play(type, trackId = 1, name, options = {}) {
+      // One-object form: FugsAudio.play({ type: "bgm", trackId: 1, name: "ThemeA", volume: 90, fadein: 2 })
+      if (type && typeof type === "object") {
+        const spec = type;
+        return this.play(spec.type, spec.trackId != null ? spec.trackId : 1, spec.name, spec);
+      }
       const opts = options || {};
       return this.playAudio({
         type,

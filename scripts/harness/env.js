@@ -499,18 +499,21 @@ async function createEnv(opts) {
    *   via "legacy": event command 356 (MV plugin command) -> Game_Interpreter.pluginCommand
    *   via "native": event command 357 (MZ plugin command) -> PluginManager.callCommand
    *   via "auto"  : MV -> legacy, MZ -> native
+   *   multi: true : the native "Run Commands (one per line)" command instead of "Run Command"
    */
   env.runCommand = async function (text, o) {
     o = o || {};
     let via = o.via || "auto";
     if (via === "auto") via = env.isMZ ? "native" : "legacy";
     const pluginName = o.pluginName || "FugsMultiTrackAudioEX";
-    sandbox.__cmd = { text, via, pluginName };
+    sandbox.__cmd = { text, via, pluginName, multi: !!o.multi };
     run(`
       (function () {
         var c = window.__cmd;
         var list = c.via === "native"
-          ? [{ code: 357, indent: 0, parameters: [c.pluginName, "run", "Run Command", { command: c.text }] }, { code: 0, indent: 0, parameters: [] }]
+          ? [{ code: 357, indent: 0, parameters: c.multi
+              ? [c.pluginName, "runMultiple", "Run Commands", { commands: c.text }]
+              : [c.pluginName, "run", "Run Command", { command: c.text }] }, { code: 0, indent: 0, parameters: [] }]
           : [{ code: 356, indent: 0, parameters: [c.text] }, { code: 0, indent: 0, parameters: [] }];
         var it = new Game_Interpreter();
         it.setup(list, 1);

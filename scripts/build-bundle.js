@@ -72,7 +72,8 @@ function main() {
       console.error("Missing: " + part.file);
       process.exit(1);
     }
-    let src = fs.readFileSync(full, "utf8");
+    // Sources may be CRLF (the Core is); the bundle is always LF so it is reproducible.
+    let src = fs.readFileSync(full, "utf8").replace(/\r\n?/g, "\n");
     if (part.role === "core") {
       src = rewriteCoreHeader(src);
       // Drop the original banner; we already wrote a generated one.
