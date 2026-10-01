@@ -178,14 +178,14 @@ forEachBackend("pan sweep", (b) => {
 });
 
 forEachBackend("ducking", (b) => {
-  it("duck-bgm1 0.3 0.5 2: drops to 30%, holds, then restores the previous volume", async () => {
+  it("duck-bgm1 0.3 0.5 2: drops to 30% of its level, holds, then restores the previous volume", async () => {
     const env = await boot(b);
     await play(env, "play-bgm1 Theme 90");
     await env.runCommand("duck-bgm1 0.3 0.5 2");
     await env.advance(700);
-    near(gainOf(env, "bgm_1"), 0.3, 0.01, "ducked");
+    near(gainOf(env, "bgm_1"), 0.27, 0.01, "ducked to 90% x 0.3");
     await env.advance(1500);
-    near(gainOf(env, "bgm_1"), 0.3, 0.01, "still held");
+    near(gainOf(env, "bgm_1"), 0.27, 0.01, "still held");
     await env.advance(1000);
     near(gainOf(env, "bgm_1"), 0.9, 0.01, "restored");
   });
@@ -197,8 +197,8 @@ forEachBackend("ducking", (b) => {
     await env.settle();
     await env.runCommand("duckall 0.3 0.5 3");
     await env.advance(800);
-    near(gainOf(env, "bgm_1"), 0.3, 0.01);
-    near(gainOf(env, "bgs_1"), 0.3, 0.01);
+    near(gainOf(env, "bgm_1"), 0.27, 0.01, "90% x 0.3");
+    near(gainOf(env, "bgs_1"), 0.18, 0.01, "60% x 0.3");
     await env.advance(4000);
     near(gainOf(env, "bgm_1"), 0.9, 0.01, "bgm restored");
     near(gainOf(env, "bgs_1"), 0.6, 0.01, "bgs restored");
@@ -212,15 +212,31 @@ forEachBackend("ducking", (b) => {
     await env.settle();
     await env.runCommand("duckall-bgm 0.2 0.3 2");
     await env.advance(500);
-    near(gainOf(env, "bgm_1"), 0.2, 0.01);
-    near(gainOf(env, "bgm_2"), 0.2, 0.01);
+    near(gainOf(env, "bgm_1"), 0.18, 0.01, "90% x 0.2");
+    near(gainOf(env, "bgm_2"), 0.18, 0.01, "90% x 0.2");
     near(gainOf(env, "bgs_1"), 0.9, 0.01, "bgs untouched");
     await env.advance(3000);
     await env.runCommand("duckall-sidechain bgm1 0.3 1 4");
     await env.advance(1300);
     near(gainOf(env, "bgm_1"), 0.9, 0.01, "excepted track untouched");
-    near(gainOf(env, "bgm_2"), 0.3, 0.01);
-    near(gainOf(env, "bgs_1"), 0.3, 0.01);
+    near(gainOf(env, "bgm_2"), 0.27, 0.01, "90% x 0.3");
+    near(gainOf(env, "bgs_1"), 0.27, 0.01, "90% x 0.3");
+  });
+
+  it("ducking is relative: a muted track stays silent and a quiet one gets quieter", async () => {
+    const env = await boot(b);
+    await play(env, "play-bgm1 Theme 90");
+    await env.runCommand("play-bgm2 Bass 0"); // a stem waiting to be faded in
+    await env.runCommand("play-bgs1 Rain 20");
+    await env.settle();
+    await env.runCommand("duckall 0.25 0.5 2");
+    await env.advance(700);
+    near(gainOf(env, "bgm_1"), 0.225, 0.01, "90% x 0.25");
+    near(gainOf(env, "bgm_2"), 0, 0.001, "muted track is not raised to the duck level");
+    near(gainOf(env, "bgs_1"), 0.05, 0.01, "20% x 0.25, not raised to 25%");
+    await env.advance(3000);
+    near(gainOf(env, "bgm_2"), 0, 0.001, "muted track restored to silence");
+    near(gainOf(env, "bgs_1"), 0.2, 0.01, "quiet track restored");
   });
 
   it("switch-controlled duck: 'duck-bgm 0.3 1 0 switch:20' ducks while switch 20 is ON", async () => {
@@ -230,7 +246,7 @@ forEachBackend("ducking", (b) => {
     near(gainOf(env, "bgm_1"), 0.9, 0.01, "armed but not active yet");
     env.run("$gameSwitches.setValue(20, true)");
     await env.advance(1300);
-    near(gainOf(env, "bgm_1"), 0.3, 0.01, "ducked while ON");
+    near(gainOf(env, "bgm_1"), 0.27, 0.01, "ducked to 90% x 0.3 while ON");
     env.run("$gameSwitches.setValue(20, false)");
     await env.advance(1300);
     near(gainOf(env, "bgm_1"), 0.9, 0.01, "restored when OFF");

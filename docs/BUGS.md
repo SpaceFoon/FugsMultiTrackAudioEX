@@ -52,6 +52,7 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 | B34 | Low | Core parameters ignored when the Core is renamed or the bundle is used under its own name | **Fixed** |
 | B35 | Medium | README's `FugsAudio.play({ type, trackId, name, … })` example played nothing | **Fixed** |
 | B36 | Low | Dev test runner: `test.mode = "human"` did nothing; `test('preset:cave')`, `test('fade:curve:smooth')` and every listed `a:b` name ran the whole group | **Fixed** |
+| B37 | Medium | `duck` / `duckall` / `duckall-sidechain` set tracks *to* the duck level, so muted or quiet tracks got louder | **Fixed** |
 
 ---
 
@@ -488,6 +489,18 @@ Found with the engine harness (`scripts/harness`, scenarios in `scripts/tests`).
 **Fix:** `test.mode` is an accessor for `TestRunner.mode`. With a colon, the registered test named by the longest prefix runs, and the rest are its parameters (`preset` + `cave`, `fade:curve` + `smooth`, `unit:parse` alone). A bare group name (`test('play')`) still runs the group.
 
 **Covered by:** `08-dev-test-runner`
+
+---
+
+#### B37 — Medium: Ducking raises muted and quiet tracks — **FIXED 2026-10-01**
+
+**Where:** `FugsAudio4Dynamics.js` `duckVolume` (used by `duck`, `duckall`, `duckall-[Type]`, `duckall-sidechain`, `FugsAudio.duck` / `duckAll`)
+
+**What was wrong:** Every track faded *to* `duckLevel` instead of *by* it. With `duckall 0.25 …`, a stem waiting at 0% jumped up to 25% (and a 20% ambience got louder) for the length of the duck. Found while building the demo game.
+
+**Fix:** The duck target is `duckLevel` × the track's current level (or its fade target, if a fade is running): 0.3 on a 90% track gives 27%, and a muted track stays muted. The restore is unchanged.
+
+**Covered by:** `05-spatial-and-dynamics` (ducking is relative: a muted track stays silent and a quiet one gets quieter)
 
 ---
 
