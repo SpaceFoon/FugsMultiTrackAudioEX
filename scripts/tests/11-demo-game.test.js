@@ -212,20 +212,16 @@ forEachBackend("demo :: Sound Garden", (b) => {
     near(gainOf(env, "bgm_1"), 0, 0.02, "drums back to muted");
   });
 
-  it(
-    "ducking leaves stems that are muted (volume 0) silent",
-    { todo: "duck/duckall set every track TO the duck level, so a muted stem is raised to it (reported, plugin fix pending)" },
-    async () => {
-      const { env, map } = await bootGarden(b);
-      await runList(env, page(map, ID.INIT));
-      await env.settle(500);
-      const list = page(map, ID.STORYTELLER);
-      const off = list.findIndex((c) => c.code === 121 && c.parameters[2] === 1);
-      await runList(env, list.slice(0, off));
-      await env.advance(1000);
-      near(gainOf(env, "bgm_1"), 0, 0.02, "muted drums stay muted during the duck");
-    }
-  );
+  it("ducking leaves stems that are muted (volume 0) silent", async () => {
+    const { env, map } = await bootGarden(b);
+    await runList(env, page(map, ID.INIT));
+    await env.settle(500);
+    const list = page(map, ID.STORYTELLER);
+    const off = list.findIndex((c) => c.code === 121 && c.parameters[2] === 1);
+    await runList(env, list.slice(0, off));
+    await env.advance(1000);
+    near(gainOf(env, "bgm_1"), 0, 0.02, "muted drums stay muted during the duck");
+  });
 
   it("the storm lever: switch 11 ON starts the rain, the second pull fades it and stops it", async () => {
     const { env, map } = await bootGarden(b);
