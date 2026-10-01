@@ -2,8 +2,8 @@
 //                         FugsAudio8Test.js                             //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Dev-only test runner for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Dev-only test runner for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help
@@ -445,51 +445,58 @@ const TestRunner = {
     return true;
   },
 
+  /**
+   * Stop a track's source node(s) and free its engine buffer.
+   * MV keeps one `_sourceNode`; MZ keeps a `_sourceNodes[]` array (chunked decoding) and needs
+   * destroy(). FugsAudio.engine hides that difference.
+   */
+  _severBuffer(buf) {
+    if (!buf) return;
+    try {
+      const engine = FugsAudio.engine;
+      const nodes = engine ? engine.sourceNodes(buf) : buf._sourceNode ? [buf._sourceNode] : [];
+      for (const node of nodes) {
+        try {
+          node.stop();
+        } catch (_e) {
+          /* ok */
+        }
+      }
+      if (engine) {
+        engine.release(buf);
+      } else {
+        buf._buffer = null;
+        if (buf._sourceNode) {
+          try {
+            buf._sourceNode.disconnect();
+          } catch (_e) {
+            /* ok */
+          }
+          buf._sourceNode = null;
+        }
+        ["_gainNode", "_pannerNode"].forEach((prop) => {
+          if (buf[prop]) {
+            try {
+              buf[prop].disconnect();
+            } catch (_e) {
+              /* ok */
+            }
+            buf[prop] = null;
+          }
+        });
+      }
+    } catch (_e) {
+      /* best effort */
+    }
+  },
+
   async cleanup() {
     // Cancel all active fades first to prevent them from resurrecting references
     FugsAudio.FadeManager.cancelAllFades();
 
     // Release decoded PCM AudioBuffers BEFORE stopAll empties the Map.
     // These are multi-MB each and the primary memory consumer.
-    for (const [, buf] of FugsAudio.tracks) {
-      try {
-        if (buf) {
-          buf._buffer = null;
-          // Also sever node refs so the context can release them
-          if (buf._sourceNode) {
-            try {
-              buf._sourceNode.stop();
-            } catch (_e) {
-              /* ok */
-            }
-            try {
-              buf._sourceNode.disconnect();
-            } catch (_e) {
-              /* ok */
-            }
-            buf._sourceNode = null;
-          }
-          if (buf._gainNode) {
-            try {
-              buf._gainNode.disconnect();
-            } catch (_e) {
-              /* ok */
-            }
-            buf._gainNode = null;
-          }
-          if (buf._pannerNode) {
-            try {
-              buf._pannerNode.disconnect();
-            } catch (_e) {
-              /* ok */
-            }
-            buf._pannerNode = null;
-          }
-        }
-      } catch (_e) {
-        /* best effort */
-      }
-    }
+    for (const [, buf] of FugsAudio.tracks) this._severBuffer(buf);
     FugsAudio.tracks.clear();
 
     // Dispose any orphaned effect chains that weren't associated with a live track
@@ -540,44 +547,8 @@ const TestRunner = {
     FugsAudio.FadeManager.cancelAllFades();
 
     // 2. Force-stop every buffer and sever all WebAudio node references
-    //    so the old context owns zero live JS references.
-    for (const [, buf] of FugsAudio.tracks) {
-      try {
-        if (buf._sourceNode) {
-          try {
-            buf._sourceNode.stop();
-          } catch (_e) {
-            /* ok */
-          }
-          try {
-            buf._sourceNode.disconnect();
-          } catch (_e) {
-            /* ok */
-          }
-          buf._sourceNode = null;
-        }
-        if (buf._gainNode) {
-          try {
-            buf._gainNode.disconnect();
-          } catch (_e) {
-            /* ok */
-          }
-          buf._gainNode = null;
-        }
-        if (buf._pannerNode) {
-          try {
-            buf._pannerNode.disconnect();
-          } catch (_e) {
-            /* ok */
-          }
-          buf._pannerNode = null;
-        }
-        // Release the decoded PCM AudioBuffer (multi-MB each)
-        buf._buffer = null;
-      } catch (_e) {
-        /* best effort */
-      }
-    }
+    //    so the old context owns zero live JS references (and free decoded PCM, multi-MB each).
+    for (const [, buf] of FugsAudio.tracks) this._severBuffer(buf);
     FugsAudio.tracks.clear();
 
     // 3. Dispose all effect chains (disconnects every node in the chain)
@@ -865,13 +836,35 @@ const TestRunner = {
     // Parse pattern: "name:param:subparam"
     const parts = pattern.split(":");
     const testName = parts[0];
-    const params = parts.slice(1);
+    let params = parts.slice(1);
+
+    // With a colon, the registered test named by the LONGEST prefix wins and the rest are its
+    // parameters, exactly as test() prints it:
+    //   test('preset:cave')        -> test "preset" with ["cave"]
+    //   test('fade:curve:smooth')  -> test "fade:curve" with ["smooth"]
+    //   test('unit:parse')         -> just that test
+    // A bare group name such as test('play') still runs every 'play' and 'play:*' test.
+    let exact = null;
+    if (parts.length > 1) {
+      for (let n = parts.length; n >= 1; n--) {
+        const candidate = parts.slice(0, n).join(":");
+        if (this.tests.has(candidate)) {
+          exact = candidate;
+          params = parts.slice(n);
+          break;
+        }
+      }
+    }
 
     // Find matching tests
     const matches = [];
-    for (const [name] of this.tests) {
-      if (name === testName || name.startsWith(testName + ":")) {
-        matches.push(name);
+    if (exact) {
+      matches.push(exact);
+    } else {
+      for (const [name] of this.tests) {
+        if (name === testName || name.startsWith(testName + ":")) {
+          matches.push(name);
+        }
       }
     }
 
@@ -1093,8 +1086,8 @@ const TestRunner = {
 ⚠️  IMPORTANT: Start a New Game or Load a save before running tests!
 
 Mode: ${this.mode.toUpperCase()} (${this.mode === "human" ? "slow, for listening" : "fast, automated"})
-  TestRunner.mode = 'human'   Slow tests for human ears
-  TestRunner.mode = 'robot'   Fast automated tests
+  test.mode = 'human'         Slow tests for human ears  (same as TestRunner.mode)
+  test.mode = 'robot'         Fast automated tests
 
 Usage:
   test('?')                 List all tests
@@ -1103,6 +1096,7 @@ Usage:
   test('preset')            Run preset test with ALL presets
   test('preset:cave')       Run preset test with just 'cave'
   test('fade:curve:smooth') Run fade:curve with just smooth curve
+  test('unit:parse')        Run one test by its full name (see test('?'))
   test('listen')            Run quick human listening smoke suite
   test('minimal')           Run minimal regression suite (recommended)
   test('*')                 Run ALL tests
@@ -1593,10 +1587,8 @@ TestRunner.add("fade:pitch:automation", async function () {
   this.assert(midPitch < startPitch, "Pitch moves downward during fade");
   this.assert(this.approx(endPitch, 0.8, 0.1), "Pitch reaches ~80% target");
 
-  const rate =
-    buf._sourceNode && buf._sourceNode.playbackRate
-      ? buf._sourceNode.playbackRate.value
-      : buf.pitch;
+  const liveNode = FugsAudio.engine.sourceNodes(buf)[0];
+  const rate = liveNode && liveNode.playbackRate ? liveNode.playbackRate.value : buf.pitch;
   if (typeof rate === "number") {
     this.assert(
       rate < startPitch && rate <= endPitch + 0.15,
@@ -5327,6 +5319,14 @@ TestRunner.add("coverage", async function () {
 // GLOBAL TEST FUNCTION
 // =====================================================================
 window.test = (pattern) => TestRunner.run(pattern);
+// README: `test.mode = "human"` is the same switch as `TestRunner.mode = "human"`.
+Object.defineProperty(window.test, "mode", {
+  get: () => TestRunner.mode,
+  set: (value) => {
+    TestRunner.mode = value;
+  },
+  enumerable: true,
+});
 window.TestRunner = TestRunner;
 
 Logger.info("Test runner loaded. Run: test() for help");

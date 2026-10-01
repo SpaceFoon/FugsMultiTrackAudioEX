@@ -2,8 +2,8 @@
 //                         FugsAudio0Docs.js                             //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Documentation / playbook for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Documentation / playbook for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help
@@ -11,7 +11,7 @@
  * =========================================================================
  * 1) WHY THIS EXISTS
  * =========================================================================
- * MV gives you 1 BGM + 1 BGS + 1 ME + 1 SE at a time with little control.
+ * MV and MZ give you 1 BGM + 1 BGS + 1 ME + 1 SE at a time with little control.
  * That blocks modern game-audio patterns.
  *
  * This plugin unlocks:
@@ -54,6 +54,15 @@
  * 3) QUICK START (3 MINUTES)
  * =========================================================================
  * All commands go in Event -> Plugin Command.
+ *
+ *   MV:  type the command text as-is:            play-bgm1 ThemeSong
+ *   MZ:  pick the plugin "FugsMultiTrackAudioEX", command "Run Command",
+ *        and type the SAME text into its Command box.
+ *        "Run Commands (one per line)" runs several commands in order
+ *        (blank lines and lines starting with // or # are ignored).
+ *        Events imported from an MV project ("Plugin Command (MV)") keep
+ *        working unchanged.
+ *   Every example in this document uses the classic text form.
  *
  * Play 2 tracks at once:
  *   play-bgm1 ThemeSong
@@ -98,10 +107,17 @@
  *
  * Parsing notes:
  *   - Filenames with spaces should be quoted: "Battle Theme".
+ *   - A {config} (proximity, registeralias, ...) is typed on ONE line; this
+ *     document only wraps long ones to fit. (MZ "Run Commands (one per line)"
+ *     also accepts a config that continues on the following lines.)
  *   - Optional tags:
  *       (p:none|scene|battle|always)
  *       (pause:never|menu|battle|scene)
  *       (start:seconds)
+ *       (loop:forever|never|N)     N = number of extra repeats after the 1st play
+ *       (curve:name)               fade curve for fade/crossfade/pitch/pan
+ *   - A file that cannot be loaded (typo, missing file) is reported in the
+ *     console (F8) as "Could not load audio/<type>/<name>" and dropped.
  *
  * Fade curves (named):
  *   linear, exponential, logarithmic, smooth, sharp, gentle,
@@ -225,7 +241,12 @@
  *   Locations:     tinyBathroom, warehouse, stoneCorridor, openField
  *   Extreme:       glitchApocalypse, totalCrushed, voidReverb, tinnySpeaker,
  *                  boomy, chaosModulation, nightmareAugmented, blown
- *   Misc:          muffled, nextroom, psychotic, stutter, overdrive
+ *   Misc:          muffled, nextroom, psychotic, stutter, overdrive, madness
+ *
+ * Effects can be requested at any time, even right after the play command:
+ * if the audio file is still loading, the effect is connected automatically
+ * as soon as the track starts. Effects also survive pause/resume and (loop:N)
+ * repeats.
  *
  * Performance note:
  *   - Effects are WebAudio node graphs; reverb is expensive.
@@ -256,12 +277,14 @@
  *       duckall-sidechain bgm1 se1 0.2 0.5 3
  *
  * True sidechain compression (envelope follower):
- *   sidechain-bgm <sourceId> <targetId> [threshold] [ratio] [attack] [release]
+ *   sidechain-bgm <source> <target> [threshold] [ratio] [attack] [release]
+ *     source/target: a BGM track NUMBER (1, 2, ...) or the FILE NAME that is
+ *                    playing on a BGM track (case-insensitive, e.g. kick bass)
  *     threshold default: 0.5 (0..1)
  *     ratio default: 4.0
  *     attack default: 0.01 seconds
  *     release default: 0.1 seconds
- *   stopsidechain-bgm <sourceId> <targetId>
+ *   stopsidechain-bgm <source> <target>
  *
  * Rhythmic pump:
  *   duckpump [bpm] [depth] [shape] [tracks]
@@ -313,7 +336,10 @@
  *     // points are [distance, volume] pairs normalized 0..1
  *
  * Performance note:
- *   - Proximity updates run on player movement; doppler recalculates pitch.
+ *   - While a proximity binding exists it is re-evaluated every frame on the
+ *     map, so moving events and smooth (sub-tile) player movement are tracked;
+ *     unchanged positions are skipped cheaply. Doppler recalculates pitch
+ *     smoothly every frame (the sound is never restarted).
  *
  * -------------------------------------------------------------------------
  * 5.7 PAN SWEEPS
@@ -372,7 +398,11 @@
  *
  * Automatic behavior:
  *   - auto snapshot saved before game save; restored after game load
- *   - battle transitions use snapshots internally
+ *     (position, volume, pan, pitch, effect, paused state, proximity,
+ *     pan sweeps, sidechains and the rhythmic pump are all saved)
+ *   - battle/menu/scene transitions do NOT use snapshots: tracks are paused,
+ *     resumed or stopped according to their persistence and pause mode
+ *     (see PERSISTENCE + PAUSE MODES below)
  *
  * -------------------------------------------------------------------------
  * 5.11 GLOBAL COMMANDS + CHAINS
@@ -450,11 +480,20 @@
  *   - Check filename spelling (case-sensitive on some platforms)
  *   - Set Debug Logs to Verbose and check console
  *   - Make sure file exists in audio/bgm (or bgs/me/se)
+ *   - Missing files are reported as "Could not load audio/<type>/<name>"
+ *   - MZ: the command must be entered with the plugin command "Run Command"
+ *     (or as an imported "Plugin Command (MV)" event)
  *
  * Effects not working:
  *   - Load this plugin AFTER other audio plugins
  *   - Check browser console
- *   - Apply effects after the track is playing
+ *   - Effects requested while the file is still loading are applied
+ *     automatically once it starts playing
+ *
+ * Volume sliders:
+ *   - Fugs tracks are independent of the Options menu BGM/BGS/ME/SE volume
+ *     sliders (they play at the volume you give them). The engine's master
+ *     volume still applies.
  *
  * Proximity not working:
  *   - Event ID must exist on the current map
@@ -493,6 +532,8 @@
  *
  * QUICK COMMANDS:
  *   FugsAudio.testCommand('play-bgm1 Battle1 90')  // Test any command
+ *   FugsAudio.runCommandText('play-bgm1 ThemeSong 90 2')  // Same text as a Plugin Command
+ *                                   // (several commands: one per line; works in Script calls)
  *   FugsAudio.list()                // Show all active tracks
  *   FugsAudio.stopAll(0)            // Stop everything
  *
@@ -509,7 +550,10 @@
  * 8) TECHNICAL NOTES + PLANNED FEATURES
  * =========================================================================
  * WebAudio notes:
- *   Uses MV's internal WebAudio implementation (private APIs).
+ *   Uses the engine's internal WebAudio implementation (private APIs) in both
+ *   MV and MZ. Everything that differs between the two engines (audio file
+ *   folders, source-node layout, plugin commands, asynchronous save/load in
+ *   MZ) is isolated in FugsAudio.engine inside the Core plugin.
  *   If you see issues: load after other audio plugins, isolate conflicts.
  *
  * Looping:
@@ -612,12 +656,13 @@
  * track's audio level controls the target track's volume dynamically -
  * industry-standard technique.
  *
- * COMMAND: sidechain-bgm <sourceId> <targetId> [threshold] [ratio] [attack]
+ * COMMAND: sidechain-bgm <source> <target> [threshold] [ratio] [attack]
  * [release]
  *
  * PARAMETERS:
- *   sourceId   - The track that triggers compression (e.g., kick drum)
- *   targetId   - The track being compressed (e.g., bass)
+ *   source     - The track that triggers compression (e.g., kick drum)
+ *                Track number (1, 2, ...) or the file name playing on it.
+ *   target     - The track being compressed (e.g., bass); same forms.
  *   threshold  - RMS level that triggers compression 0-1 (default: 0.5)
  *   ratio      - Compression ratio (default: 4.0 = 4:1 compression)
  *   attack     - How fast compression engages in seconds (default: 0.01)
@@ -625,14 +670,18 @@
  *
  * EXAMPLES:
  *   sidechain-bgm kick bass 0.4 6.0 0.005 0.15
- *   // Kick (source) ducks bass (target) with 6:1 ratio, fast attack
+ *   // Kick (source) ducks bass (target) with 6:1 ratio, fast attack.
+ *   // "kick" / "bass" are the FILE NAMES playing on two BGM tracks
+ *   // (e.g. after: play-bgm1 Kick   play-bgm2 Bass). Same as:
+ *   sidechain-bgm 1 2 0.4 6.0 0.005 0.15
  *
  *   sidechain-bgm dialog music 0.3 3.0 0.02 0.2
  *   // Dialog ducks music for clarity
  *
  * STOP SIDECHAIN:
- *   stopsidechain-bgm <sourceId> <targetId>
+ *   stopsidechain-bgm <source> <target>
  *   stopsidechain-bgm kick bass
+ *   stopsidechain-bgm 1 2
  *
  * USE CASES:
  *   - Classic "pumping" effect (kick ducking bass/pads)
@@ -901,6 +950,16 @@
  *   always      | menu       | Pauses    | Continues
  *   always      | battle     | Continues | Pauses
  *
+ * What "Pauses" means: the track fades out over the Scene Fadeout Time, is
+ * paused (its position is kept) and comes back where it left off when the
+ * battle/menu ends. The battle column of the table is what happens on the way
+ * INTO a battle; a track that Pauses or Continues is still there afterwards
+ * (returning from a battle is not a map change). The one exception: a
+ * (p:none) track that was STARTED during the battle ends with it.
+ * (pause:scene) tracks pause when the scene changes (map transfer, new game,
+ * load) and resume as soon as the new map scene is created. Tracks you paused
+ * by hand with pause-... are never resumed automatically.
+ *
  * Pitfall:
  *   - Overusing (p:always) is how you end up with “forgotten” tracks.
  *
@@ -995,16 +1054,21 @@
  * =========================================================================
  * 0) SPEC
  * =========================================================================
- * Version: 2.2
- * Target: RPG Maker MV 1.6.3 (plugin header: @target MV 1.63)
+ * Version: 2.3
+ * Target: RPG Maker MV 1.6.x AND RPG Maker MZ 1.x (plugin header: @target MZ;
+ *         the plugin detects the engine at runtime and works in both).
  * File:   js/plugins/FugsMultiTrackAudioEX.js
- * Runtime assumptions: NW.js 0.29+ (Chromium 65 / Node 9.7.1).
+ * Runtime assumptions: MV: NW.js 0.29+ (Chromium 65 / Node 9.7.1) — the code
+ *         is written to that level. MZ: the NW.js that ships with MZ.
+ * Also verified for: MZ served over http(s) (chunked audio download) and MV on
+ *         Android Chrome (BGM does not go through the shared Html5Audio element).
  *
  * Repo docs:
  *   README.md                         — install + load order
  *   docs/MULTI_PLUGIN_SPLIT_PLAN.md   — architecture / phases
- *   docs/BUGS.md                      — known defects (B01–B16 fixed)
+ *   docs/BUGS.md                      — known defects and fixes
  *   scripts/verify-all.js             — offline Node verification gate
+ *   scripts/tests/                    — MV + MZ engine scenario tests
  *   dist/FugsMultiTrackAudioEX.bundle.js — optional all-in-one build
  *
  * =========================================================================

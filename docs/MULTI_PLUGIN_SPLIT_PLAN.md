@@ -1,9 +1,10 @@
 # FugsMultiTrackAudioEX — Multi-Plugin Split Plan
 
-**Status:** **DONE** (Phases 1–6 + B01–B16 + save/load extensions + soft-transition bundle). Remaining: optional in-game `test('play')` on a real MV project.  
+**Status:** **DONE** (Phases 1–6 + B01–B16 + save/load extensions + soft-transition bundle + v2.3 MV/MZ compatibility audit, B17–B36). Remaining: optional in-game `test('play')` and an ear-check in a real MV / MZ project.  
 **Source:** Core + Docs + Effects + Spatial + Dynamics + Switch + Aliases + Compat + Test  
 **Goal:** Split the monolith into readable, independently loadable RPG Maker MV plugins without breaking gameplay, save data, or the existing `FugsAudio` / plugin-command APIs.  
-**Last review:** 2026-08-09 — `node scripts/verify-all.js` green (syntax + 50 modular smoke + 11 bundle smoke).
+**Last review:** 2026-09-30 — `node scripts/verify-all.js` green (syntax + 50 modular smoke + 11 bundle smoke + Chromium 65 syntax/API scan + engine scenarios on the MV and MZ models, modular and bundle; MZ also against the real 1.7.0 scripts).  
+**Engines:** RPG Maker MV 1.6 **and MZ 1.x**. All engine differences sit behind `FugsAudio.engine` in the Core (see [`BUGS.md`](BUGS.md) → Compatibility audit).
 
 ---
 
@@ -528,8 +529,8 @@ Core `play` must call `FugsAudio.tryPlayAlias?.(…)` (or similar) so Aliases ca
 
 ## 9. Smoke / Acceptance Checklist
 
-Offline gate: `node scripts/verify-all.js` (syntax + modular smoke + bundle).  
-In-game items still need a real MV project (ear-check / scene transitions).
+Offline gate: `node scripts/verify-all.js` (syntax + modular smoke + bundle + MV-compat scan + engine scenarios, see README → Verification).  
+In-game items still need a real MV / MZ project (ear-check / scene transitions).
 
 ### Core-only
 
@@ -567,7 +568,8 @@ In-game items still need a real MV project (ear-check / scene transitions).
 - [x] Alias register + play — Node smoke
 - [x] Compat loads idle without OcRam — Node smoke (full pack load)
 - [x] `FugsAudio8Test` loads (`test` global) — Node smoke
-- [ ] `await test('play')` in a real MV project — in-game
+- [x] `test('play')` and the other in-game groups — run inside the engine harness on MV + MZ (`08-dev-test-runner`)
+- [ ] `await test('play')` in a real MV / MZ project — in-game
 
 ---
 
@@ -682,7 +684,8 @@ MV projects copy these into `js/plugins/`. Keep the numbers so Plugin Manager fi
 3. ~~Proximity / panSweep / sidechain / pump save-restore~~ **done** (`ext.*` + `__fugsMeta`)
 4. ~~Soft-transition bundle~~ **done** — `node scripts/build-bundle.js` → `dist/FugsMultiTrackAudioEX.bundle.js`
 5. ~~Offline verify gate~~ **done** — `node scripts/verify-all.js`
-6. **Only remaining (needs your MV project):** enable pack + `FugsAudio8Test` → `await test('play')` and listen through menu/battle/save.
+6. ~~MZ support + compatibility audit~~ **done** (v2.3) — `FugsAudio.engine`, MZ `@command` (`Run Command`), Promise-based `loadGame`, chunked-streaming decode, B17–B36.
+7. **Only remaining (needs your MV / MZ project):** enable pack + `FugsAudio8Test` → `await test('play')` and listen through menu/battle/save; in the MZ editor confirm *Plugin Command… → Run Command* shows its text box.
 
 Plugin Manager (production):
 

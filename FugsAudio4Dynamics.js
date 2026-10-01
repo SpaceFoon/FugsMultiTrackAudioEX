@@ -2,8 +2,8 @@
 //                        FugsAudio4Dynamics.js                          //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Duck, sidechain, pump, pitchbendall for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Duck, sidechain, pump, pitchbendall for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help
@@ -57,19 +57,42 @@
 
   hub.ensurePumpNode = function(buffer) {
       if (!buffer || !buffer._gainNode || !buffer._pannerNode) return false;
-      if (buffer._pumpGainNode) return true;
       if (!WebAudio._context) return false;
+      // The engines create NEW gain/panner nodes every time a buffer (re)starts (repeat loops,
+      // resume, MZ pitch restarts). The pump node must follow them, so re-insert it whenever the
+      // nodes it was wired to are no longer the buffer's current ones.
+      if (
+        buffer._pumpGainNode &&
+        buffer._pumpWiredGain === buffer._gainNode &&
+        buffer._pumpWiredPanner === buffer._pannerNode
+      ) {
+        return true;
+      }
 
       try {
+        let level = 1.0;
+        if (buffer._pumpGainNode) {
+          try {
+            level = buffer._pumpGainNode.gain.value;
+          } catch (_) {
+            level = 1.0;
+          }
+          try {
+            buffer._pumpGainNode.disconnect();
+          } catch (_) {
+            /* already disconnected */
+          }
+        }
+
         // Create pump gain node
         buffer._pumpGainNode = WebAudio._context.createGain();
-        buffer._pumpGainNode.gain.value = 1.0;
+        buffer._pumpGainNode.gain.value = level;
 
         // Insert: gainNode -> pumpGainNode -> pannerNode
-        // We disconnect gainNode (which connects to pannerNode in standard MV)
-        // and insert our node in between.
+        // Only the gain -> panner link is replaced (a no-argument disconnect() would also cut
+        // other taps on the gain node, e.g. a sidechain analyser).
         try {
-          buffer._gainNode.disconnect();
+          buffer._gainNode.disconnect(buffer._pannerNode);
         } catch (_) {
           Logger.debugOnce(
             "ensurePumpNode: gainNode already disconnected",
@@ -79,6 +102,8 @@
         }
         buffer._gainNode.connect(buffer._pumpGainNode);
         buffer._pumpGainNode.connect(buffer._pannerNode);
+        buffer._pumpWiredGain = buffer._gainNode;
+        buffer._pumpWiredPanner = buffer._pannerNode;
 
         return true;
       } catch (e) {
@@ -147,6 +172,22 @@
       }
     };
 
+  // A sidechain endpoint may be given as a BGM track number ("1") or, as the Docs' examples do
+  // ("sidechain-bgm kick bass ..."), as the file name playing on a BGM track (case-insensitive).
+  // Either way the connection is keyed by track NUMBER so save/restore and teardown keep working.
+  hub._resolveBgmTrackId = function(ref) {
+      const raw = String(ref);
+      if (this.tracks.has(`bgm_${raw}`)) return raw;
+      const wanted = raw.toLowerCase();
+      for (const [key, buf] of this.tracks.entries()) {
+        if (!key.startsWith("bgm_")) continue;
+        if (buf && typeof buf._name === "string" && buf._name.toLowerCase() === wanted) {
+          return key.substring(4);
+        }
+      }
+      return raw;
+    };
+
   hub.setupSidechain = function(args) {
       try {
         if (!WebAudio._context) {
@@ -154,8 +195,8 @@
           return false;
         }
 
-        const sourceId = String(args[0]);
-        const targetId = String(args[1]);
+        const sourceId = this._resolveBgmTrackId(args[0]);
+        const targetId = this._resolveBgmTrackId(args[1]);
         const threshold = this.toNum(args[2], 0.5); // RMS threshold (0-1)
         // Clamp ratio >= 1 to prevent division by zero; attack/release >= 0.001 for coefficient math
         const ratio = Math.max(1.0, this.toNum(args[3], 4.0));
@@ -379,8 +420,8 @@
     };
 
   hub.stopSidechain = function(args) {
-      const sourceId = String(args[0]);
-      const targetId = String(args[1]);
+      const sourceId = this._resolveBgmTrackId(args[0]);
+      const targetId = this._resolveBgmTrackId(args[1]);
       const connectionKey = `${sourceId}_to_${targetId}`;
 
       const connection = this.sidechainConnections.get(connectionKey);
