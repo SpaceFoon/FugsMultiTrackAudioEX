@@ -72,7 +72,7 @@ forEachBackend("README quick start: with satellites enabled", (b) => {
 
     await env.runCommand("duckall 0.3 0.5 2");
     await env.advance(700);
-    near(gainOf(env, "bgm_1"), 0.3, 0.02, "bgm ducked to level 0.3");
+    near(gainOf(env, "bgm_1"), 0.27, 0.02, "bgm ducked to 90% x 0.3");
 
     await env.runCommand("registeralias Footstep {pool:[Step1,Step2], volumeJitter:5}");
     assert.equal(env.A.sfxAliases.has("Footstep"), true);
