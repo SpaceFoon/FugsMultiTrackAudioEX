@@ -62,6 +62,12 @@ Do **not** enable both the bundle and `FugsAudio2…7` at once.
 
 ---
 
+## Demo game
+
+[`demo/`](demo) holds **Sound Garden**, a small playable map for MZ and MV where each villager and object shows one feature: layered stems, effects, proximity and doppler, ducking, pan sweeps, `switch:N`, footstep aliases, battle pause/resume and save/load. All music, sounds and art are original and generated from code. Install it into a new project with `node demo/install.js <project folder>`; see [`demo/README.md`](demo/README.md).
+
+---
+
 ## Running commands
 
 The command text is identical on both engines (`play-bgm1 ThemeA 90 2`); only the place you type it differs.
