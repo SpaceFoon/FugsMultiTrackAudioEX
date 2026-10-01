@@ -182,3 +182,26 @@ forEachBackend("audio context timing", (b) => {
     assert.deepEqual(env.logs.error.filter((l) => /TypeError|Cannot read/.test(l)), []);
   });
 });
+
+forEachBackend("slow downloads over http", (b) => {
+  const web = (files) => boot(b, { envOpts: { web: true }, files });
+
+  it("a big file on a slow connection is not dropped as missing", async () => {
+    // MV downloads the WHOLE file before decoding; 45 s is a ~5 MB BGM on a slow mobile link.
+    const env = await web((e) => e.addAudio("bgm", "BigTheme", { duration: 60, latencyMs: 45000 }));
+    await env.runCommand("play-bgm1 BigTheme 90");
+    await env.advance(50000);
+    assert.deepEqual(keys(env), ["bgm_1"], "still there once the download finishes");
+    assert.ok(audibleSourcesOf(env, "bgm_1").length >= 1, "and playing");
+    assert.ok(!env.logs.error.some((l) => /BigTheme/.test(l)), "no load error: " + JSON.stringify(env.logs.error));
+  });
+
+  it("a file the server answers 404 for is still dropped eventually", async () => {
+    const env = await web();
+    env.net.missingFileBehavior = "404";
+    await env.runCommand("play-se1 DoesNotExist");
+    await env.advance(125000);
+    assert.deepEqual(keys(env), [], "failed loads are dropped");
+    assert.ok(env.logs.error.some((l) => /DoesNotExist/.test(l)), JSON.stringify(env.logs.error));
+  });
+});

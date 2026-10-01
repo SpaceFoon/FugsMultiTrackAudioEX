@@ -167,6 +167,9 @@
 
     // Audio load watchdog (missing / corrupt files must not leave zombie tracks)
     LOAD_TIMEOUT_MS: 30000,
+    // Served over http(s) a large file can legitimately take far longer to arrive (MV downloads
+    // the whole file before decoding), and a 404 never raises a load error there.
+    LOAD_TIMEOUT_WEB_MS: 120000,
     LOAD_POLL_MS: 250,
 
     // Distance curve math
@@ -1567,13 +1570,18 @@
     _watchLoad(key, buffer, type, name) {
       if (!Engine.isLoading(buffer) && !Engine.hasFailed(buffer)) return;
       const startedAt = performance.now();
+      const servedOverHttp =
+        typeof location !== "undefined" && /^https?:/i.test(String(location.protocol || location.href || ""));
+      const timeoutMs = servedOverHttp
+        ? AUDIO_CONSTANTS.LOAD_TIMEOUT_WEB_MS
+        : AUDIO_CONSTANTS.LOAD_TIMEOUT_MS;
 
       const check = () => {
         if (this.tracks.get(key) !== buffer) return; // stopped or replaced meanwhile
         if (typeof buffer.isReady === "function" && buffer.isReady()) return; // loaded fine
 
         const failed = Engine.hasFailed(buffer);
-        const timedOut = performance.now() - startedAt > AUDIO_CONSTANTS.LOAD_TIMEOUT_MS;
+        const timedOut = performance.now() - startedAt > timeoutMs;
         if (failed || timedOut) {
           Logger.error(
             `Could not load audio/${String(type).toLowerCase()}/${name} ` +

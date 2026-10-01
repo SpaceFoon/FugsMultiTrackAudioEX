@@ -375,9 +375,9 @@ Found with the engine harness (`scripts/harness`, scenarios in `scripts/tests`).
 
 **What was wrong:** A typo'd name kept a track that never played and was polled forever; `play-bgm1` with no file name asked the engine for `audio/bgm/undefined`.
 
-**Fix:** Empty names are rejected with a warning. A load that fails, or takes longer than 30 s (`LOAD_TIMEOUT_MS`), is reported as `Could not load audio/<type>/<name>` and the track is cleaned up.
+**Fix:** Empty names are rejected with a warning. A load that fails, or takes longer than 30 s (`LOAD_TIMEOUT_MS`; 120 s, `LOAD_TIMEOUT_WEB_MS`, when the game is served over http(s), so a big file on a slow connection is not mistaken for a missing one), is reported as `Could not load audio/<type>/<name>` and the track is cleaned up.
 
-**Covered by:** `02-playback` (a missing audio file does not leave a zombie track or a busy timer loop)
+**Covered by:** `02-playback` (a missing audio file does not leave a zombie track or a busy timer loop), `07-deployment-variants` (slow downloads over http)
 
 ---
 
