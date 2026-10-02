@@ -173,6 +173,24 @@ node scripts/check-mv-compat.js           # syntax/APIs newer than MV's Chromium
 node --test scripts/tests/*.test.js       # engine scenarios on the MV and MZ models
 ```
 
+Or, without installing Node, in Docker (PowerShell: `${PWD}` instead of `$PWD`):
+
+```bash
+docker build -t fugs-audio .
+docker run --rm fugs-audio                     # the whole gate (add --fast to skip the bundle re-run)
+docker run --rm -v "/path/to/mz-project/js:/mz:ro" -e RMMZ_JS_DIR=/mz fugs-audio   # + real MZ scripts
+```
+
+The image copies the repo in at build time, so run `docker build` again after changing files.
+
+### Releasing
+
+```bash
+docker run --rm -v "$PWD/release:/out" fugs-audio release 2.3.0
+```
+
+This runs the whole gate and, only if it passes, writes `release/FugsMultiTrackAudioEX-v2.3.0.zip`: the nine plugin files, the rebuilt all-in-one bundle, `LICENSE`, this README and an `INSTALL.txt`. It refuses to package when a plugin's `@plugindesc` version does not match (2.3.0 needs `v2.3`). The same sources always give the same zip bytes. Without Docker: `node scripts/verify-all.js && node scripts/package-release.js 2.3.0`. Uploading the zip (GitHub release, itch.io, your site) is a manual step.
+
 ### Engine scenarios (`scripts/harness`, `scripts/tests`)
 
 The mocks the first smoke tests used were too loose to see engine differences, so there is a proper harness: a deterministic virtual clock (timers, animation frames, `performance.now`, `AudioContext.currentTime`), a strict fake Web Audio graph (real `connect`/`disconnect` rules, `AudioParam` automation, playback-position integration), and engine backends that the whole pack is loaded into exactly as a game does (plugins first, audio context afterwards). Assertions look at the audio graph, i.e. what a listener would hear — not at the plugin's own bookkeeping.
