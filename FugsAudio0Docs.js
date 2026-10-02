@@ -45,7 +45,7 @@
  *   - pauseMode:  whether the track auto-PAUSEs (and later resumes)
  *
  * Ducking / sidechain / pump are different tools:
- *   - duck / duckall: fixed temporary volume reduction then restore.
+ *   - duck / duckall: temporary volume reduction (relative to each track's level), then restore.
  *   - duckall-sidechain: duck everything EXCEPT specified tracks.
  *   - sidechain-bgm: true envelope follower driven by another track’s RMS.
  *   - duckpump: tempo-synced rhythmic modulation (sine/square/saw/heartbeat).
@@ -265,7 +265,8 @@
  *
  * Full reference:
  *   duck-[Type][Track]? [duckLevel] [fadeTime] [holdTime] switch:[id]?
- *     duckLevel: 0.0..1.0 (fraction)
+ *     duckLevel: 0.0..1.0, a fraction of the track's CURRENT volume
+ *                (0.3 at 90% -> 27%; a muted track stays muted)
  *     holdTime:  seconds (0 = infinite with switch control)
  *
  *   duckall [duckLevel] [fadeTime] [holdTime]

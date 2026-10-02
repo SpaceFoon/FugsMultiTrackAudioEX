@@ -7863,16 +7863,20 @@
       // Otherwise, restore to current volume
       const restoreVolume = activeFade ? activeFade.targetValue : buffer.volume;
 
+      // duckLevel is a FRACTION of the track's own level (0.3 = 30% of what it is now), so a
+      // muted stem stays silent and a quiet track never gets louder when ducking starts.
+      const duckedVolume = restoreVolume * duckLevel;
+
       if (switchId && holdTime === 0) {
         // Switch-controlled ducking - duck immediately, restore when switch turns off
         Logger.info(
           `Starting switch-controlled duck for ${key}: ${Math.round(
             restoreVolume * 100
-          )}% -> ${duckLevel * 100}% (switch ${switchId})`
+          )}% -> ${Math.round(duckedVolume * 100)}% (switch ${switchId})`
         );
 
         this.fadeAudio(type, trackId, {
-          volume: duckLevel * 100,
+          volume: duckedVolume * 100,
           duration: fadeTime,
         });
 
@@ -7899,10 +7903,10 @@
         Logger.info(
           `Starting timed duck for ${key}: ${Math.round(
             restoreVolume * 100
-          )}% -> ${duckLevel * 100}% for ${holdTime}s`
+          )}% -> ${Math.round(duckedVolume * 100)}% for ${holdTime}s`
         );
 
-        this.fadeAudio(type, trackId, { volume: duckLevel * 100, duration: fadeTime }, () => {
+        this.fadeAudio(type, trackId, { volume: duckedVolume * 100, duration: fadeTime }, () => {
           if (holdTime > 0) {
             Logger.success(`Duck phase complete for ${key}, holding for ${holdTime}s`);
             const timeoutId = setTimeout(() => {
@@ -7920,7 +7924,7 @@
 
               Logger.info(
                 `Starting duck restore for ${key}: ${
-                  duckLevel * 100
+                  Math.round(duckedVolume * 100)
                 }% -> ${Math.round(restoreVolume * 100)}%`
               );
               this.fadeAudio(
