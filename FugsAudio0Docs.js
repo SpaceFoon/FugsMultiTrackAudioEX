@@ -102,6 +102,9 @@
  *       (p:none|scene|battle|always)
  *       (pause:never|menu|battle|scene)
  *       (start:seconds)
+ *       (subloop:start-end[:switch])
+ *       (subloop:meta)
+ *       (subloopfade:seconds)
  *
  * Fade curves (named):
  *   linear, exponential, logarithmic, smooth, sharp, gentle,
@@ -136,6 +139,7 @@
  * Full reference:
  *   play-[Type][Track]? [name] [volume]? [fadein]? [pan]? [pitch]?
  *     (p:mode)? (pause:mode)? (start:seconds)?
+ *     (subloop:start-end[:switch])? (subloop:meta)? (subloopfade:seconds)?
  *       volume: 0..100 (default 90)
  *       fadein: seconds (default 0)
  *       pan:    -100..100 (default 0)
@@ -358,6 +362,53 @@
  *
  * Pitfall:
  *   If you never run the event containing the plugin command, nothing is registered.
+ *   play + (subloop:...) + switch:N is a hold gate, not play/stop. See 5.12.
+ *
+ * -------------------------------------------------------------------------
+ * 5.12 SWITCH-HELD SUB-LOOPS
+ * -------------------------------------------------------------------------
+ * Why:
+ *   Hold a section of a song until a switch releases, then continue into
+ *   the rest of the file (outro) and the native OGG LOOPSTART/LOOPLENGTH.
+ *
+ * Minimal:
+ *   play-bgm1 Theme (subloop:12-24) switch:15
+ *
+ * Behavior:
+ *   The song starts immediately. switch:N does NOT start/stop the track.
+ *   Switch ON  = wrap at the region end (hold).
+ *   Switch OFF = play through into the next section.
+ *   Mid-region OFF does not jump; the current pass finishes.
+ *   Multiple sequential regions are allowed; they must not overlap.
+ *
+ * Recipes:
+ *   - Boss hold, then outro:
+ *       Control Switch 15 ON
+ *       play-bgm1 BossTheme (subloop:12-24) switch:15
+ *       (when the boss dies) Control Switch 15 OFF
+ *   - Two holds, optional wrap fade:
+ *       play-bgm1 Theme (subloop:12-24:15) (subloop:40-56:20) (subloopfade:1)
+ *   - Times from the audio file:
+ *       play-bgm1 Theme (subloop:meta) switch:15
+ *
+ * Full reference:
+ *   (subloop:start-end)              seconds, same unit as (start:)
+ *   (subloop:start-end:switchId)     per-region switch (third field is never fade)
+ *   switch:N                         default hold switch for regions that omitted an id
+ *   (subloop:meta)                   FUGSSUBLOOP=12.0-24.0 and/or SUBLOOPSTART/SUBLOOPEND
+ *   (subloopfade:seconds)            wrap crossfade via a hidden twin buffer
+ *   (curve:name)                     wrap fade curve (default smooth)
+ *
+ * Composer layout:
+ *   Put hold regions inside the native loop body. LOOPLENGTH must include any
+ *   material you want after a release. If LOOPLENGTH ends at the same sample
+ *   as a sub-loop, nothing after that sample can play.
+ *   Typical: turn the hold switch ON before/as play runs, OFF to continue.
+ *
+ * Pitfalls:
+ *   Regions with no switch id are ignored.
+ *   Nested/overlapping regions are dropped (later one).
+ *   syncplay-* does not take subloop tags.
  *
  * -------------------------------------------------------------------------
  * 5.10 SNAPSHOTS (saveall / loadall)
@@ -400,7 +451,8 @@
  *
  * Core playback:
  *   FugsAudio.play(type, trackId, name, options)
- *     options: { volume, fadein, pan, pitch, persistence, pauseMode, startTime, effect }
+ *     options: { volume, fadein, pan, pitch, persistence, pauseMode, startTime, effect,
+ *                subloops, subloopFade, subloopMeta, switchId }
  *   FugsAudio.stop(type, trackId, fadeout)
  *   FugsAudio.fade(type, trackId, options)
  *     options: { volume, duration, pan, pitch, curve }
@@ -790,6 +842,9 @@
  * ARM A COMMAND:
  *   play-bgm DangerTheme switch:15
  *   // Plays when switch 15 turns ON, stops when it turns OFF
+ *
+ *   play-bgm1 Theme (subloop:12-24) switch:15
+ *   // Song plays immediately; switch 15 holds 12s-24s instead of start/stop
  *
  *   duck-bgm 0.3 1 0 switch:20
  *   // Ducks BGM when switch 20 is ON, restores when OFF

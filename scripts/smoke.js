@@ -41,6 +41,9 @@ function makeBuffer(name, opts) {
     _loadListeners: [],
     _playing: false,
     _seekVal: opts.seekVal != null ? opts.seekVal : 0,
+    _totalTime: opts.totalTime != null ? opts.totalTime : 8,
+    _loopStart: 0,
+    _loopLength: 0,
     volume: 1,
     pan: 0,
     pitch: 1,
@@ -162,6 +165,114 @@ ok("capture hooks >=2", A._captureStateHooks.length >= 2);
 ok("restore hooks >=2", A._restoreStateHooks.length >= 2);
 ok("parse loop (B02)", (A.parseCommand("play-bgm1", ["Theme", "(loop:3)"]) || {}).loop === 3);
 ok("isKnown pansweep", A.isKnownPluginCommand("pansweep-bgm1"));
+
+{
+  const hold = A.parseCommand("play-bgm1", ["Theme", "(subloop:12-24)", "switch:15"]);
+  ok("subloop region parsed", !!(hold && hold.subloops && hold.subloops[0] && hold.subloops[0].start === 12 && hold.subloops[0].end === 24));
+  ok("subloop inherits switch:15", !!(hold && hold.subloops && hold.subloops[0] && hold.subloops[0].switchId === 15));
+  ok("subloop is hold not gate", A._commandHasSubloops(hold) === true);
+  const gated = A.parseCommand("play-bgm1", ["Theme", "switch:15"]);
+  ok("plain switch:N still gated", A._commandHasSubloops(gated) === false);
+  const perRegion = A.parseCommand("play-bgm1", ["Theme", "(subloop:12-24:15)", "(subloop:40-56:20)", "(subloopfade:1)"]);
+  ok(
+    "two subloops + fade",
+    !!(
+      perRegion &&
+      perRegion.subloops &&
+      perRegion.subloops.length === 2 &&
+      perRegion.subloops[1].switchId === 20 &&
+      perRegion.subloopFade === 1
+    )
+  );
+  const overlap = A.parseCommand("play-bgm1", ["Theme", "(subloop:12-24:15)", "(subloop:20-30:15)"]);
+  ok("overlap dropped", !!(overlap && overlap.subloops && overlap.subloops.length === 1));
+  const meta = A.parseCommand("play-bgm1", ["Theme", "(subloop:meta)", "switch:15"]);
+  ok("subloop meta flag", !!(meta && meta.subloopMeta === true && A._commandHasSubloops(meta)));
+  const comments = A._parseSubloopCommentString("FUGSSUBLOOP=8-16 SUBLOOPSTART=44100 SUBLOOPEND=88200", 44100);
+  ok("comment parser", !!(comments && comments.length >= 2 && comments[0].start === 1 && comments[1].start === 8));
+
+  const origExec = A.executeCommand;
+  let executed = 0;
+  let gatedCalls = 0;
+  A.executeCommand = function () {
+    executed += 1;
+    return true;
+  };
+  const prevHandlers = A._switchGatedHandlers.slice();
+  A._switchGatedHandlers = [
+    function () {
+      gatedCalls += 1;
+      return true;
+    },
+  ];
+  const interp = Object.create(global.Game_Interpreter.prototype);
+  interp.pluginCommand("play-bgm1", ["Theme", "(subloop:12-24)", "switch:15"]);
+  ok("pluginCommand subloop executes immediately", executed === 1 && gatedCalls === 0);
+  interp.pluginCommand("play-bgm1", ["Theme", "switch:15"]);
+  ok("pluginCommand plain switch still gated", executed === 1 && gatedCalls === 1);
+  A.executeCommand = origExec;
+  A._switchGatedHandlers = prevHandlers;
+
+  pendingBuffers.push({ totalTime: 30 });
+  ok(
+    "playAudio arms subloops",
+    A.playAudio({
+      type: "bgm",
+      trackId: "8",
+      name: "HoldTheme",
+      volume: 90,
+      fadein: 0,
+      subloops: [{ start: 12, end: 24, switchId: 15 }],
+    }) === true
+  );
+  const held = A.tracks.get("bgm_8");
+  ok("subloop state on buffer", !!(held && held._fugsSubloops && held._fugsSubloops[0] && held._fugsSubloops[0].end === 24));
+  const captured = A.captureTrackState("bgm_8", held);
+  ok("capture subloops", !!(captured && captured.subloops && captured.subloops[0] && captured.subloops[0].start === 12));
+  A.stopAudio("bgm", "8", 0);
+
+  const switches = {};
+  global.$gameSwitches = { value: (id) => !!switches[id] };
+  const plays = [];
+  const holdBuf = makeBuffer("HoldEngine", { totalTime: 80 });
+  holdBuf._fugsSubloops = [{ start: 12, end: 24, switchId: 15 }];
+  holdBuf._fugsSubloopFade = 0;
+  holdBuf._fugsLoopMode = "forever";
+  holdBuf._loopStart = 10;
+  holdBuf._loopLength = 70;
+  holdBuf.play = function (loop, offset) {
+    plays.push({ loop: !!loop, offset: offset || 0 });
+    this._playing = true;
+  };
+  A.tracks.set("bgm_hold", holdBuf);
+  switches[15] = true;
+  A._runSubloopFence("bgm_hold", holdBuf, {
+    type: "region",
+    region: holdBuf._fugsSubloops[0],
+    at: 24,
+    fade: 0,
+  });
+  ok(
+    "hold ON wraps to region start",
+    plays.length >= 1 && plays[0].loop === false && plays[0].offset === 12
+  );
+  A._clearTimeoutsByRole("bgm_hold", ["subloopWrap"]);
+  plays.length = 0;
+  switches[15] = false;
+  A._runSubloopFence("bgm_hold", holdBuf, {
+    type: "region",
+    region: holdBuf._fugsSubloops[0],
+    at: 24,
+    fade: 0,
+  });
+  ok("hold OFF continues (no wrap play)", plays.length === 0);
+  A._clearTimeoutsByRole("bgm_hold", ["subloopWrap"]);
+  holdBuf._fugsSubloopWrapping = true;
+  A._disposeSubloopTwin("bgm_hold", holdBuf);
+  ok("dispose twin clears wrapping flag", holdBuf._fugsSubloopWrapping === false);
+  A.stopAudio("bgm", "hold", 0);
+  delete global.$gameSwitches;
+}
 
 // B09 orphan cleanup
 {
@@ -377,10 +488,40 @@ ok("accept global capture hooks", A._captureGlobalStateHooks.length >= 1);
 ok("accept global restore hooks", A._restoreGlobalStateHooks.length >= 1);
 
 setTimeout(() => {
-  const failed = results.filter((r) => !r.pass);
-  for (const r of results) {
-    console.log((r.pass ? "OK  " : "FAIL ") + r.name);
+  const TR = global.TestRunner;
+  const unitFn = TR && TR.tests && TR.tests.get("unit:subloop");
+  if (typeof unitFn === "function") {
+    TR.reset();
+    try {
+      const ret = unitFn.call(TR, []);
+      if (ret && typeof ret.then === "function") {
+        ret.then(finishUnitSubloop).catch((e) => {
+          ok("unit:subloop", false);
+          console.error("unit:subloop crashed", e && e.message ? e.message : e);
+          finishUnitSubloop();
+        });
+        return;
+      }
+    } catch (e) {
+      ok("unit:subloop", false);
+      console.error("unit:subloop crashed", e && e.message ? e.message : e);
+    }
+    finishUnitSubloop();
+    return;
   }
-  console.log(failed.length ? `FAILED ${failed.length}/${results.length}` : `ALL PASS ${results.length}`);
-  process.exit(failed.length ? 1 : 0);
+  finishReport();
+
+  function finishUnitSubloop() {
+    ok("unit:subloop", TR.results.failed === 0);
+    finishReport();
+  }
+
+  function finishReport() {
+    const failed = results.filter((r) => !r.pass);
+    for (const r of results) {
+      console.log((r.pass ? "OK  " : "FAIL ") + r.name);
+    }
+    console.log(failed.length ? `FAILED ${failed.length}/${results.length}` : `ALL PASS ${results.length}`);
+    process.exit(failed.length ? 1 : 0);
+  }
 }, 80);

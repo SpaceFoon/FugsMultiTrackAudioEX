@@ -3754,6 +3754,125 @@ TestRunner.add("unit:consumeParenTag", async function () {
   }
 });
 
+TestRunner.add("unit:subloop", async function () {
+  console.log("Testing subloop parser, routing, comments, and fence math...");
+  const assertEq = (a, b, msg) => this.assert(a === b, `${msg}: expected ${b}, got ${a}`);
+  const assertDeep = (a, b, msg) =>
+    this.assert(
+      JSON.stringify(a) === JSON.stringify(b),
+      `${msg}: expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`
+    );
+
+  {
+    const r = FugsAudio.checkSubloops(["Theme", "(subloop:12-24)", "90"]);
+    assertEq(r.subloops.length, 1, "one region");
+    assertEq(r.subloops[0].start, 12, "start 12");
+    assertEq(r.subloops[0].end, 24, "end 24");
+    assertDeep(r.args, ["Theme", "90"], "tag consumed");
+    assertEq(r.subloopMeta, false, "not meta");
+  }
+  {
+    const r = FugsAudio.checkSubloops(["(subloop:12-24)", "(subloop:40-56)"]);
+    assertEq(r.subloops.length, 2, "two sequential regions");
+    assertEq(r.subloops[1].start, 40, "second start");
+  }
+  {
+    const r = FugsAudio.checkSubloops(["(subloop:12-24:15)"]);
+    assertEq(r.subloops[0].switchId, 15, "per-region switch");
+  }
+  {
+    const r = FugsAudio.checkSubloops(["(subloop:12-24)", "(subloop:20-30)"]);
+    assertEq(r.subloops.length, 1, "overlap dropped");
+    assertEq(r.subloops[0].end, 24, "kept earlier region");
+  }
+  {
+    const r = FugsAudio.checkSubloops(["(subloop:24-12)"]);
+    assertEq(r.subloops.length, 0, "end<=start dropped");
+  }
+  {
+    const r = FugsAudio.checkSubloops(["(subloop:meta)"]);
+    assertEq(r.subloopMeta, true, "meta flag");
+    assertEq(r.subloops.length, 0, "meta has no times yet");
+  }
+  {
+    const r = FugsAudio.checkSubloopFade(["Theme", "(subloopfade:1.5)"]);
+    assertEq(r.subloopFade, 1.5, "subloopfade parsed");
+    assertDeep(r.args, ["Theme"], "fade tag consumed");
+  }
+
+  {
+    const p = FugsAudio.parseCommand("play-bgm1", ["Theme", "(subloop:12-24)", "switch:15"]);
+    assertEq(p.switchId, 15, "command switch parsed");
+    assertEq(p.subloops.length, 1, "region kept");
+    assertEq(p.subloops[0].switchId, 15, "bare switch fills region");
+    this.assert(FugsAudio._commandHasSubloops(p) === true, "hold command, not play-gate");
+  }
+  {
+    const p = FugsAudio.parseCommand("play-bgm1", ["Theme", "(subloop:12-24:15)", "(subloop:40-56:20)"]);
+    assertEq(p.switchId, null, "no bare switch");
+    assertEq(p.subloops.length, 2, "two per-region switches");
+    assertEq(p.subloops[1].switchId, 20, "second switch 20");
+    this.assert(FugsAudio._commandHasSubloops(p) === true, "per-region still a hold command");
+  }
+  {
+    const p = FugsAudio.parseCommand("play-bgm1", ["Theme", "switch:15"]);
+    this.assert(FugsAudio._commandHasSubloops(p) === false, "plain switch:N is still gated play");
+  }
+  {
+    const p = FugsAudio.parseCommand("play-bgm1", ["Theme", "(subloop:12-24)"]);
+    assertEq(p.subloops.length, 0, "region without switch ignored");
+    this.assert(FugsAudio._commandHasSubloops(p) === false, "no hold without a switch");
+  }
+  {
+    const p = FugsAudio.parseCommand("play-bgm1", [
+      "Theme",
+      "(subloop:12-24)",
+      "switch:15",
+      "(subloopfade:1)",
+      "(curve:linear)",
+    ]);
+    assertEq(p.subloopFade, 1, "fade on command");
+    assertEq(p.curve, "linear", "curve still parsed");
+  }
+
+  {
+    const comments = "LOOPSTART=1000 LOOPLENGTH=5000 FUGSSUBLOOP=12.0-24.0 FUGSSUBLOOP=40-56";
+    const parsed = FugsAudio._parseSubloopCommentString(comments, 44100);
+    assertEq(parsed.length, 2, "two FUGSSUBLOOP regions");
+    assertEq(parsed[0].start, 12, "first start seconds");
+    assertEq(parsed[1].end, 56, "second end");
+  }
+  {
+    const comments = "SUBLOOPSTART=44100 SUBLOOPEND=88200 SUBLOOPSTART_2=176400 SUBLOOPEND_2=220500";
+    const parsed = FugsAudio._parseSubloopCommentString(comments, 44100);
+    assertEq(parsed.length, 2, "indexed SUBLOOPSTART pairs");
+    assertEq(parsed[0].start, 1, "samples/sr = 1s");
+    assertEq(parsed[1].end, 5, "second end 5s");
+  }
+
+  {
+    const buf = {
+      _fugsSubloops: [
+        { start: 12, end: 24, switchId: 15 },
+        { start: 40, end: 56, switchId: 20 },
+      ],
+      _fugsSubloopFade: 0,
+      _fugsLoopMode: "forever",
+      _totalTime: 80,
+      _loopStart: 10,
+      _loopLength: 70,
+    };
+    const atIntro = FugsAudio._subloopNextEvent(buf, 0);
+    assertEq(atIntro.type, "region", "intro approaches first hold");
+    assertEq(atIntro.region.end, 24, "first fence at 24");
+    const afterA = FugsAudio._subloopNextEvent(buf, 24.01);
+    assertEq(afterA.region.start, 40, "next fence is second region");
+    const afterB = FugsAudio._subloopNextEvent(buf, 56.01);
+    assertEq(afterB.type, "fileLoop", "then native file loop");
+    assertEq(afterB.to, 10, "wrap to LOOPSTART");
+  }
+});
+
 TestRunner.add("unit:toNumParity", async function () {
   console.log("Testing AudioEffects.toNum parity with FugsAudio.toNum...");
   const assertEq = (a, b, msg) => this.assert(a === b, `${msg}: expected ${b}, got ${a}`);
@@ -5276,8 +5395,12 @@ TestRunner.add("coverage", async function () {
       "parseCommand",
       "parseClassicSyntax",
       "consumeParenTag",
+      "consumeAllParenTags",
       "checkStartTime",
       "checkLoop",
+      "checkSubloops",
+      "checkSubloopFade",
+      "_commandHasSubloops",
       "checkCurve",
       "checkPersistence",
       "checkPauseMode",
@@ -5510,6 +5633,7 @@ TestRunner.add("coverage", async function () {
     "FugsMultiTrackAudioEX.parseCommand": ["unit:parse", "unit:command", "unit:parseClassic"],
     "FugsMultiTrackAudioEX.parseClassicSyntax": ["unit:parse", "unit:parseClassic"],
     "FugsMultiTrackAudioEX.consumeParenTag": ["unit:consumeParenTag"],
+    "FugsMultiTrackAudioEX.consumeAllParenTags": ["unit:subloop"],
     "FugsMultiTrackAudioEX.checkStartTime": ["unit:consumeParenTag", "unit:modifiers"],
     "FugsMultiTrackAudioEX.checkLoop": [
       "unit:consumeParenTag",
@@ -5517,6 +5641,9 @@ TestRunner.add("coverage", async function () {
       "unit:loop",
       "unit:loopFull",
     ],
+    "FugsMultiTrackAudioEX.checkSubloops": ["unit:subloop"],
+    "FugsMultiTrackAudioEX.checkSubloopFade": ["unit:subloop"],
+    "FugsMultiTrackAudioEX._commandHasSubloops": ["unit:subloop"],
     "FugsMultiTrackAudioEX.checkCurve": ["unit:consumeParenTag", "unit:modifiers", "fix:B40-fadeCurve"],
     "FugsMultiTrackAudioEX.checkPersistence": ["unit:consumeParenTag", "unit:modifiers"],
     "FugsMultiTrackAudioEX.checkPauseMode": ["unit:consumeParenTag", "unit:modifiers"],

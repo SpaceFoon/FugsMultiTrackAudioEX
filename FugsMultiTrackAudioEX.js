@@ -525,6 +525,7 @@
         window.AudioEffects.init();
       }
       this._registerCoreLifecycle();
+      this._installSubloopMetaHook();
       // SwitchManager.init() runs in FugsAudio5Switch when loaded.
       // Only log at verbose level to avoid console clutter
       if (loggingLevel >= 4) {
@@ -1041,6 +1042,11 @@
             pauseMode: commandObject.pauseMode || DefaultPauseMode,
             effect: commandObject.effect,
             startTime: commandObject.startTime || this.toNum(args[5], 0),
+            subloops: commandObject.subloops,
+            subloopFade: commandObject.subloopFade,
+            subloopMeta: commandObject.subloopMeta,
+            subloopCurve: commandObject.curve,
+            switchId: commandObject.switchId,
           });
 
         case "stop":
@@ -1498,6 +1504,644 @@
       schedule();
     },
 
+    _commandHasSubloops(parsed) {
+      if (!parsed) return false;
+      if (parsed.subloopMeta) return true;
+      return Array.isArray(parsed.subloops) && parsed.subloops.length > 0;
+    },
+
+    _validHoldSwitchId(id) {
+      const n = parseInt(id, 10);
+      return Number.isFinite(n) && n >= 1 && n <= 5000 ? n : null;
+    },
+
+    _holdSwitchOn(switchId) {
+      const id = this._validHoldSwitchId(switchId);
+      if (!id) return false;
+      if (typeof $gameSwitches === "undefined" || !$gameSwitches) return false;
+      if (typeof $gameSwitches.value !== "function") return false;
+      try {
+        return !!$gameSwitches.value(id);
+      } catch (_e) {
+        return false;
+      }
+    },
+
+    _parseSubloopSpec(raw) {
+      if (raw == null) return undefined;
+      const v = String(raw).trim();
+      if (!v) return undefined;
+      if (v.toLowerCase() === "meta") return { meta: true };
+
+      const withSwitch = /^([0-9]*\.?[0-9]+)\s*-\s*([0-9]*\.?[0-9]+)\s*:\s*(\d+)$/.exec(v);
+      if (withSwitch) {
+        const start = Number(withSwitch[1]);
+        const end = Number(withSwitch[2]);
+        const switchId = this._validHoldSwitchId(withSwitch[3]);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < 0) {
+          return undefined;
+        }
+        const spec = { start, end };
+        if (switchId) spec.switchId = switchId;
+        return spec;
+      }
+
+      const rangeOnly = /^([0-9]*\.?[0-9]+)\s*-\s*([0-9]*\.?[0-9]+)$/.exec(v);
+      if (rangeOnly) {
+        const start = Number(rangeOnly[1]);
+        const end = Number(rangeOnly[2]);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < 0) {
+          return undefined;
+        }
+        return { start, end };
+      }
+
+      return undefined;
+    },
+
+    _normalizeSubloopRegions(regions) {
+      const list = Array.isArray(regions) ? regions.slice() : [];
+      const kept = [];
+      for (let i = 0; i < list.length; i++) {
+        const raw = list[i];
+        if (!raw || raw.meta) continue;
+        const start = Number(raw.start);
+        const end = Number(raw.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+          Logger.warn(
+            `Subloop dropped (end must be > start): ${raw.start}-${raw.end}`
+          );
+          continue;
+        }
+        const switchId = this._validHoldSwitchId(raw.switchId);
+        kept.push(switchId ? { start, end, switchId } : { start, end });
+      }
+      kept.sort((a, b) => a.start - b.start || a.end - b.end);
+      const out = [];
+      for (let i = 0; i < kept.length; i++) {
+        const region = kept[i];
+        const prev = out[out.length - 1];
+        if (prev && region.start < prev.end) {
+          Logger.warn(
+            `Subloop dropped (overlaps previous ${prev.start}-${prev.end}): ${region.start}-${region.end}`
+          );
+          continue;
+        }
+        out.push(region);
+      }
+      return out;
+    },
+
+    _assignSubloopSwitches(regions, defaultSwitchId) {
+      const fallback = this._validHoldSwitchId(defaultSwitchId);
+      const assigned = [];
+      const list = Array.isArray(regions) ? regions : [];
+      for (let i = 0; i < list.length; i++) {
+        const region = list[i];
+        if (!region || region.meta) continue;
+        const switchId = this._validHoldSwitchId(region.switchId) || fallback;
+        if (!switchId) {
+          Logger.warn(
+            `Subloop ${region.start}-${region.end} has no switch id — ignored`
+          );
+          continue;
+        }
+        assigned.push({ start: region.start, end: region.end, switchId });
+      }
+      return this._normalizeSubloopRegions(assigned);
+    },
+
+    consumeAllParenTags(args, tagName, parseValue, isValid) {
+      const values = [];
+      const re = new RegExp(`\\(${tagName}:([^\\)]+)\\)`, "i");
+      const keep = [];
+      const list = Array.isArray(args) ? args : [];
+      for (let i = 0; i < list.length; i++) {
+        const arg = list[i];
+        if (typeof arg !== "string") {
+          keep.push(arg);
+          continue;
+        }
+        const match = arg.match(re);
+        if (!match) {
+          keep.push(arg);
+          continue;
+        }
+        const parsed = parseValue(match[1]);
+        if (!isValid(parsed)) {
+          Logger.warn(`Invalid (${tagName}:${match[1]}) ignored`);
+          continue;
+        }
+        values.push(parsed);
+      }
+      return { args: keep, values };
+    },
+
+    checkSubloops(args) {
+      const parsed = this.consumeAllParenTags(
+        args,
+        "subloop",
+        (raw) => this._parseSubloopSpec(raw),
+        (val) => !!val
+      );
+      let subloopMeta = false;
+      const regions = [];
+      for (let i = 0; i < parsed.values.length; i++) {
+        const spec = parsed.values[i];
+        if (spec && spec.meta) subloopMeta = true;
+        else if (spec) regions.push(spec);
+      }
+      return {
+        args: parsed.args,
+        subloops: this._normalizeSubloopRegions(regions),
+        subloopMeta,
+      };
+    },
+
+    checkSubloopFade(args) {
+      const parsed = this.consumeParenTag(
+        args,
+        "subloopfade",
+        (raw) => Number(raw),
+        (n) => typeof n === "number" && !isNaN(n) && n >= 0
+      );
+      return {
+        args: parsed.args,
+        subloopFade: parsed.value != null ? parsed.value : 0,
+      };
+    },
+
+    _commentValueToSeconds(raw, sampleRate) {
+      const text = String(raw).trim();
+      const n = Number(text);
+      if (!Number.isFinite(n) || n < 0) return null;
+      if (text.indexOf(".") !== -1) return n;
+      if (sampleRate > 0) return n / sampleRate;
+      return n;
+    },
+
+    _parseSubloopCommentString(text, sampleRate) {
+      const src = text != null ? String(text) : "";
+      const sr = Number(sampleRate) || 0;
+      const regions = [];
+
+      const fugsRe = /FUGSSUBLOOP\s*=\s*([0-9]*\.?[0-9]+)\s*-\s*([0-9]*\.?[0-9]+)/gi;
+      let match;
+      while ((match = fugsRe.exec(src))) {
+        const start = Number(match[1]);
+        const end = Number(match[2]);
+        if (Number.isFinite(start) && Number.isFinite(end)) {
+          regions.push({ start, end });
+        }
+      }
+
+      const starts = {};
+      const ends = {};
+      const startRe = /SUBLOOPSTART(?:_(\d+))?\s*=\s*([0-9]*\.?[0-9]+)/gi;
+      while ((match = startRe.exec(src))) {
+        const idx = match[1] ? parseInt(match[1], 10) : 1;
+        const seconds = this._commentValueToSeconds(match[2], sr);
+        if (seconds != null) starts[idx] = seconds;
+      }
+      const endRe = /SUBLOOPEND(?:_(\d+))?\s*=\s*([0-9]*\.?[0-9]+)/gi;
+      while ((match = endRe.exec(src))) {
+        const idx = match[1] ? parseInt(match[1], 10) : 1;
+        const seconds = this._commentValueToSeconds(match[2], sr);
+        if (seconds != null) ends[idx] = seconds;
+      }
+      const ids = Object.keys(starts)
+        .map((k) => parseInt(k, 10))
+        .sort((a, b) => a - b);
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        if (ends[id] != null) regions.push({ start: starts[id], end: ends[id] });
+      }
+
+      return this._normalizeSubloopRegions(regions);
+    },
+
+    _bytesToAsciiScan(array, maxBytes) {
+      if (array == null) return "";
+      if (typeof array === "string") return array;
+      let view = array;
+      if (array instanceof ArrayBuffer) view = new Uint8Array(array);
+      if (!view || typeof view.length !== "number") return "";
+      const n = Math.min(view.length, maxBytes || 524288);
+      let out = "";
+      const chunk = 4096;
+      for (let i = 0; i < n; i += chunk) {
+        const end = Math.min(n, i + chunk);
+        const parts = new Array(end - i);
+        for (let j = i; j < end; j++) {
+          const b = view[j];
+          parts[j - i] = b >= 32 && b < 127 ? String.fromCharCode(b) : " ";
+        }
+        out += parts.join("");
+      }
+      return out;
+    },
+
+    _extractSubloopComments(buffer, array) {
+      if (!buffer) return;
+      const text = this._bytesToAsciiScan(array, 524288);
+      if (!text) return;
+      const sr =
+        buffer._sampleRate ||
+        (buffer._buffer && buffer._buffer.sampleRate) ||
+        0;
+      const parsed = this._parseSubloopCommentString(text, sr);
+      if (parsed.length) buffer._fugsFileSubloops = parsed;
+    },
+
+    _installSubloopMetaHook() {
+      if (typeof WebAudio === "undefined" || !WebAudio.prototype) return;
+      if (WebAudio._fugsSubloopMetaHooked) return;
+      WebAudio._fugsSubloopMetaHooked = true;
+      const self = this;
+      const proto = WebAudio.prototype;
+      const wrap = (name) => {
+        if (typeof proto[name] !== "function") return false;
+        const orig = proto[name];
+        proto[name] = function (array) {
+          const result = orig.apply(this, arguments);
+          try {
+            self._extractSubloopComments(this, array);
+          } catch (_e) {
+            /* comment scan is best-effort */
+          }
+          return result;
+        };
+        return true;
+      };
+      if (!wrap("_readLoopComments")) wrap("_readOgg");
+    },
+
+    _copySubloopState(from, to) {
+      if (!from || !to) return;
+      const fields = this._subloopSnapshotFields(from);
+      to._fugsSubloops = fields.subloops;
+      to._fugsSubloopFade = fields.subloopFade;
+      to._fugsSubloopCurve = fields.subloopCurve;
+      to._fugsSubloopMeta = fields.subloopMeta;
+      to._fugsSubloopDefaultSwitch =
+        from.subloopDefaultSwitch != null
+          ? from.subloopDefaultSwitch
+          : from._fugsSubloopDefaultSwitch;
+      to._fugsFileSubloops = from._fugsFileSubloops;
+      if (from._fugsTrackKey) to._fugsTrackKey = from._fugsTrackKey;
+    },
+
+    _subloopSnapshotFields(source) {
+      if (!source) {
+        return { subloops: null, subloopFade: 0, subloopCurve: "smooth", subloopMeta: false };
+      }
+      return {
+        subloops: Array.isArray(source.subloops)
+          ? source.subloops
+          : source._fugsSubloops || null,
+        subloopFade:
+          source.subloopFade != null
+            ? source.subloopFade
+            : source._fugsSubloopFade || 0,
+        subloopCurve:
+          source.subloopCurve || source._fugsSubloopCurve || "smooth",
+        subloopMeta: !!(source.subloopMeta || source._fugsSubloopMeta),
+      };
+    },
+
+    _bufferHasSubloops(buffer) {
+      return !!(buffer && Array.isArray(buffer._fugsSubloops) && buffer._fugsSubloops.length);
+    },
+
+    _fileLoopBounds(buffer) {
+      const total = typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
+      let loopStart = typeof buffer._loopStart === "number" ? buffer._loopStart : 0;
+      let loopLength = typeof buffer._loopLength === "number" ? buffer._loopLength : 0;
+      const sr =
+        buffer._sampleRate ||
+        (buffer._buffer && buffer._buffer.sampleRate) ||
+        0;
+      if (sr > 0 && total > 0 && loopLength > total + 0.5) {
+        loopStart = loopStart / sr;
+        loopLength = loopLength / sr;
+      }
+      const loopEnd = loopLength > 0 ? loopStart + loopLength : total;
+      return {
+        loopStart: loopStart > 0 ? loopStart : 0,
+        loopEnd: loopEnd > 0 ? loopEnd : total,
+        total,
+      };
+    },
+
+    _clipSubloopsToDuration(buffer) {
+      if (!buffer || !Array.isArray(buffer._fugsSubloops)) return;
+      const total = typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
+      if (!(total > 0)) return;
+      const next = [];
+      for (let i = 0; i < buffer._fugsSubloops.length; i++) {
+        const region = buffer._fugsSubloops[i];
+        if (region.start >= total) {
+          Logger.warn(
+            `Subloop start ${region.start}s past duration ${total}s — dropped`
+          );
+          continue;
+        }
+        const end = Math.min(region.end, total);
+        if (end <= region.start) continue;
+        next.push({ start: region.start, end, switchId: region.switchId });
+      }
+      buffer._fugsSubloops = this._normalizeSubloopRegions(next);
+    },
+
+    _applyMetaSubloops(buffer) {
+      if (!buffer || !buffer._fugsSubloopMeta) return;
+      const file = Array.isArray(buffer._fugsFileSubloops) ? buffer._fugsFileSubloops : [];
+      if (!file.length) {
+        Logger.warn("subloop:meta requested but no FUGSSUBLOOP/SUBLOOPSTART comments found");
+        return;
+      }
+      const assigned = this._assignSubloopSwitches(
+        file,
+        buffer._fugsSubloopDefaultSwitch
+      );
+      const merged = (buffer._fugsSubloops || []).concat(assigned);
+      buffer._fugsSubloops = this._normalizeSubloopRegions(merged);
+    },
+
+    _subloopNextEvent(buffer, pos) {
+      const regions = (buffer && buffer._fugsSubloops) || [];
+      const fadeWanted = buffer && buffer._fugsSubloopFade > 0 ? buffer._fugsSubloopFade : 0;
+      const bounds = this._fileLoopBounds(buffer);
+      let nextRegion = null;
+      for (let i = 0; i < regions.length; i++) {
+        if (regions[i].end > pos + 1e-4) {
+          nextRegion = regions[i];
+          break;
+        }
+      }
+
+      if (nextRegion) {
+        const regionLen = nextRegion.end - nextRegion.start;
+        const fadeUse =
+          fadeWanted > 0 ? Math.min(fadeWanted, Math.max(0, regionLen * 0.45)) : 0;
+        const at = Math.max(pos, nextRegion.end - fadeUse);
+        return { type: "region", region: nextRegion, at, fade: fadeUse };
+      }
+
+      const fileEnd = bounds.loopEnd > 0 ? bounds.loopEnd : bounds.total;
+      if (buffer && buffer._fugsLoopMode === "forever") {
+        return {
+          type: "fileLoop",
+          at: fileEnd > pos ? fileEnd : bounds.total,
+          to: bounds.loopStart,
+        };
+      }
+      if (
+        buffer &&
+        typeof buffer._fugsLoopRepeatsRemaining === "number" &&
+        buffer._fugsLoopRepeatsRemaining > 0
+      ) {
+        return { type: "fileRepeat", at: bounds.total };
+      }
+      return { type: "fileEnd", at: bounds.total };
+    },
+
+    _restartBufferAt(key, buffer, offset, thenSchedule) {
+      if (!buffer || !key) return;
+      try {
+        buffer.stop();
+      } catch (_e) {
+        /* already stopped */
+      }
+      buffer.play(false, offset > 0 ? offset : 0);
+      if (buffer._effect) {
+        this.applyEffectIfPresent(key, buffer._effect);
+        this.connectEffectChain(key, buffer);
+      }
+      this.updateTrackPitch(buffer);
+      if (thenSchedule) this._scheduleSubloopFence(key, buffer, offset || 0);
+    },
+
+    _disposeSubloopTwin(key, buffer) {
+      FadeManager.cancelFade(`${key}__subloopWrap`);
+      const host = buffer || (this.tracks && this.tracks.get(key));
+      if (host) host._fugsSubloopWrapping = false;
+      const twin = host && host._fugsSubloopTwin;
+      if (!twin) return;
+      this._stopBufferSafely(twin);
+      this._releaseBuffer(twin);
+      host._fugsSubloopTwin = null;
+    },
+
+    _wrapSubloopInstant(key, buffer, start) {
+      this._clearTimeoutsByRole(key, ["subloopWrap"]);
+      this._restartBufferAt(key, buffer, start, true);
+    },
+
+    _wrapSubloopFade(key, buffer, region, fade, curve) {
+      if (!buffer || fade < 0.02) {
+        this._wrapSubloopInstant(key, buffer, region.start);
+        return;
+      }
+      const typeAndId = typeof key === "string" ? key.split("_") : [];
+      const type = typeAndId[0];
+      const name = buffer._name;
+      if (!type || !name || typeof AudioManager === "undefined") {
+        this._wrapSubloopInstant(key, buffer, region.start);
+        return;
+      }
+
+      buffer._fugsSubloopWrapping = true;
+      this._disposeSubloopTwin(key, buffer);
+
+      let twin;
+      try {
+        twin = AudioManager.createBuffer(type.toLowerCase(), name);
+      } catch (_e) {
+        twin = null;
+      }
+      if (!twin) {
+        buffer._fugsSubloopWrapping = false;
+        this._wrapSubloopInstant(key, buffer, region.start);
+        return;
+      }
+
+      this._copySubloopState(buffer, twin);
+      twin._name = name;
+      twin._persistence = buffer._persistence;
+      twin._pauseMode = buffer._pauseMode;
+      twin._effect = buffer._effect;
+      twin._originalVolume = buffer._originalVolume;
+      twin._fugsManualStop = false;
+      twin._fugsLoopMode = buffer._fugsLoopMode;
+      twin._fugsLoopRepeatsRemaining = buffer._fugsLoopRepeatsRemaining;
+      twin._manualVolume = buffer._manualVolume;
+      twin._manualPan = buffer._manualPan;
+      twin._basePitch = buffer._basePitch;
+      twin._dopplerPitch = buffer._dopplerPitch || 1;
+      twin.pan = buffer.pan;
+      twin.volume = 0;
+      buffer._fugsSubloopTwin = twin;
+
+      const mixerVol = this._getMixerVolume(buffer);
+      const wrapCurve = curve || buffer._fugsSubloopCurve || "smooth";
+
+      const startTwin = () => {
+        if (this.tracks.get(key) !== buffer) {
+          this._disposeSubloopTwin(key, buffer);
+          return;
+        }
+        twin.play(false, region.start);
+        this.updateTrackPitch(twin);
+
+        FadeManager.startFade(
+          `${key}__subloopWrap`,
+          0,
+          1,
+          fade,
+          (p) => {
+            const gOut = Math.sqrt(Math.max(0, 1 - p));
+            const gIn = Math.sqrt(Math.max(0, p));
+            if (this.tracks.get(key) === buffer) buffer.volume = mixerVol * gOut;
+            twin.volume = mixerVol * gIn;
+          },
+          () => {
+            if (this.tracks.get(key) !== buffer) {
+              this._stopBufferSafely(twin);
+              this._releaseBuffer(twin);
+              return;
+            }
+            try {
+              buffer.stop();
+            } catch (_e) {
+              /* ok */
+            }
+            twin._fugsSubloopWrapping = false;
+            twin.volume = mixerVol;
+            this.tracks.set(key, twin);
+            buffer._fugsSubloopTwin = null;
+            this._releaseBuffer(buffer);
+            if (twin._effect) {
+              this.applyEffectIfPresent(key, twin._effect);
+              this.connectEffectChain(key, twin);
+            }
+            this.updateTrackPitch(twin);
+            this._scheduleSubloopFence(key, twin, region.start);
+          },
+          wrapCurve
+        );
+      };
+
+      if (
+        typeof twin.isReady === "function" &&
+        !twin.isReady() &&
+        typeof twin.addLoadListener === "function"
+      ) {
+        twin.addLoadListener(startTwin);
+      } else {
+        startTwin();
+      }
+    },
+
+    _runSubloopFence(key, buffer, decision) {
+      if (!decision || !buffer) return;
+      if (decision.type === "region") {
+        if (this._holdSwitchOn(decision.region.switchId)) {
+          if (decision.fade > 0) {
+            this._wrapSubloopFade(
+              key,
+              buffer,
+              decision.region,
+              decision.fade,
+              buffer._fugsSubloopCurve
+            );
+          } else {
+            this._wrapSubloopInstant(key, buffer, decision.region.start);
+          }
+          return;
+        }
+        this._scheduleSubloopFence(key, buffer, decision.region.end + 0.001);
+        return;
+      }
+      if (decision.type === "fileLoop") {
+        this._wrapSubloopInstant(key, buffer, decision.to || 0);
+        return;
+      }
+      if (decision.type === "fileRepeat") {
+        buffer._fugsLoopRepeatsRemaining -= 1;
+        this._wrapSubloopInstant(key, buffer, 0);
+        return;
+      }
+      Logger.info(`Auto-cleanup: ${key} finished playing`);
+      this._releaseBuffer(buffer);
+      this.tracks.delete(key);
+      this.cleanupTrack(key);
+    },
+
+    _scheduleSubloopFence(key, buffer, offsetSeconds) {
+      if (!buffer || !key) return;
+      this._clearTimeoutsByRole(key, ["subloopWrap"]);
+
+      const tick = (forcedPos) => {
+        if (this.tracks.get(key) !== buffer) return;
+        if (buffer._fugsManualStop) return;
+        if (buffer._fugsSubloopWrapping) return;
+
+        const totalTime = typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
+        if (totalTime <= 0) {
+          buffer._fugsSubloopRetries = (buffer._fugsSubloopRetries || 0) + 1;
+          if (buffer._fugsSubloopRetries > 50) {
+            Logger.warn(`Subloop timer gave up for ${key} (_totalTime=${totalTime})`);
+            return;
+          }
+          const retryId = setTimeout(() => tick(forcedPos), 200);
+          this._trackTimeout(key, retryId, "subloopWrap");
+          return;
+        }
+        buffer._fugsSubloopRetries = 0;
+
+        let pos = forcedPos;
+        if (pos == null && typeof buffer.seek === "function") {
+          try {
+            pos = buffer.seek();
+          } catch (_e) {
+            pos = 0;
+          }
+        }
+        pos = this.toNum(pos, 0);
+
+        const decision = this._subloopNextEvent(buffer, pos);
+        if (!decision) return;
+
+        const pitchNow =
+          typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
+        const remaining = (decision.at - pos) / pitchNow;
+        if (remaining <= 0.03) {
+          this._runSubloopFence(key, buffer, decision);
+          return;
+        }
+        const delayMs = Math.min(250, Math.max(20, remaining * 1000));
+        const timeoutId = setTimeout(() => tick(null), delayMs);
+        this._trackTimeout(key, timeoutId, "subloopWrap");
+      };
+
+      const startTicks = () => {
+        this._applyMetaSubloops(buffer);
+        this._clipSubloopsToDuration(buffer);
+        tick(typeof offsetSeconds === "number" ? offsetSeconds : null);
+      };
+
+      if (
+        typeof buffer.isReady === "function" &&
+        !buffer.isReady() &&
+        typeof buffer.addLoadListener === "function"
+      ) {
+        buffer.addLoadListener(startTicks);
+        return;
+      }
+      startTicks();
+    },
+
     playAudio(options) {
       const {
         type,
@@ -1512,6 +2156,11 @@
         effect = null,
         loop, // boolean | 'forever' | 'never' | number (repeat count)
         startTime = 0,
+        subloops: rawSubloops,
+        subloopFade = 0,
+        subloopMeta = false,
+        subloopCurve,
+        switchId: holdSwitchId,
       } = options;
 
       const normalizeLoop = () => {
@@ -1554,7 +2203,10 @@
       };
 
       const loopCfg = normalizeLoop();
-      const shouldLoop = loopCfg.mode === "forever";
+      const shouldLoopNative = loopCfg.mode === "forever";
+      const assignedSubloops = this._assignSubloopSwitches(rawSubloops, holdSwitchId);
+      const subloopArmed = assignedSubloops.length > 0 || !!subloopMeta;
+      const shouldLoop = shouldLoopNative && !subloopArmed;
 
       const key = `${type}_${trackId}`;
 
@@ -1577,6 +2229,12 @@
         buffer._originalVolume = volume / 100;
         buffer._fugsManualStop = false;
         buffer._fugsLoopMode = loopCfg.mode; // "forever" | "repeat" | "never"
+        buffer._fugsTrackKey = key;
+        buffer._fugsSubloops = assignedSubloops;
+        buffer._fugsSubloopFade = this.toNum(subloopFade, 0);
+        buffer._fugsSubloopCurve = subloopCurve || "smooth";
+        buffer._fugsSubloopMeta = !!subloopMeta;
+        buffer._fugsSubloopDefaultSwitch = this._validHoldSwitchId(holdSwitchId);
 
         this.tracks.set(key, buffer);
 
@@ -1601,10 +2259,16 @@
         }
 
         // Loop modes:
-        // - forever: use WebAudio looping (no end timer)
+        // - forever without subloops: use WebAudio looping (no end timer)
+        // - subloops armed: Fugs owns wrapping (native loop off)
         // - repeat: play once, then restart on end N times
         // - never: play once
-        if (loopCfg.mode === "repeat") {
+        if (subloopArmed) {
+          if (loopCfg.mode === "repeat") {
+            buffer._fugsLoopRepeatsRemaining = loopCfg.repeatCount;
+          }
+          this._scheduleSubloopFence(key, buffer, startTime);
+        } else if (loopCfg.mode === "repeat") {
           buffer._fugsLoopRepeatsRemaining = loopCfg.repeatCount;
           this._scheduleTrackEndAction(key, buffer, startTime);
         } else if (!shouldLoop) {
@@ -1893,6 +2557,7 @@
 
       // Cancel any pending timeouts for this track immediately (e.g. finite-loop end timers)
       this._clearAllTimeouts(key);
+      this._disposeSubloopTwin(key, buffer);
 
       if (fadeout > 0) {
         Logger.info(`Stopping ${key} with ${fadeout}s fadeout`);
@@ -2224,6 +2889,11 @@
         dopplerPitch: buffer._dopplerPitch || 1.0,
         loopMode: buffer._fugsLoopMode || null,
         loopRepeatsRemaining: buffer._fugsLoopRepeatsRemaining || 0,
+        subloops: buffer._fugsSubloops || null,
+        subloopFade: buffer._fugsSubloopFade || 0,
+        subloopCurve: buffer._fugsSubloopCurve || "smooth",
+        subloopMeta: !!buffer._fugsSubloopMeta,
+        subloopDefaultSwitch: buffer._fugsSubloopDefaultSwitch || null,
       };
       this.pausedSnapshots.set(key, pausedSnapshot);
 
@@ -2246,7 +2916,9 @@
       }
 
       // B38: pause only cancels timeouts that must die with pause (not chain/duckRestore/crossfade)
-      this._clearTimeoutsByRole(key, ["pauseStop", "endAction"]);
+      this._clearTimeoutsByRole(key, ["pauseStop", "endAction", "subloopWrap"]);
+      this._disposeSubloopTwin(key, buffer);
+      FadeManager.cancelFade(`${key}__subloopWrap`);
 
       // B16: mark paused immediately so resume works during fadeout
       this.pausedTracks.add(key);
@@ -2342,6 +3014,10 @@
 
       // Resolve loop mode from snapshot/buffer
       const loopMode = snapshot ? snapshot.loopMode : buffer ? buffer._fugsLoopMode : null;
+      const subloopFields = this._subloopSnapshotFields(snapshot || buffer);
+      const hasSubloops =
+        (Array.isArray(subloopFields.subloops) && subloopFields.subloops.length > 0) ||
+        !!subloopFields.subloopMeta;
 
       // For repeat-mode tracks, delegate to playAudio which owns the
       // end-action timer.  The manual resume path below handles
@@ -2384,6 +3060,31 @@
           effect: savedEffect,
           startTime: startPos,
           loop: remaining || 0,
+          subloops: snapshot
+            ? snapshot.subloops
+            : buffer
+              ? buffer._fugsSubloops
+              : undefined,
+          subloopFade: snapshot
+            ? snapshot.subloopFade
+            : buffer
+              ? buffer._fugsSubloopFade
+              : 0,
+          subloopMeta: snapshot
+            ? snapshot.subloopMeta
+            : buffer
+              ? buffer._fugsSubloopMeta
+              : false,
+          subloopCurve: snapshot
+            ? snapshot.subloopCurve
+            : buffer
+              ? buffer._fugsSubloopCurve
+              : undefined,
+          switchId: snapshot
+            ? snapshot.subloopDefaultSwitch
+            : buffer
+              ? buffer._fugsSubloopDefaultSwitch
+              : undefined,
         });
       }
 
@@ -2402,17 +3103,22 @@
         // Pause cancelled end timers — re-arm for one-shots (B04)
         const typeKeyFast = (type || "").toLowerCase();
         const shouldLoopFast =
-          loopMode === "forever" ||
-          (loopMode == null && typeKeyFast !== "se" && typeKeyFast !== "me");
-        if (!shouldLoopFast) {
-          let posFast = startPos;
-          if (buffer.seek && typeof buffer.seek === "function") {
-            try {
-              posFast = buffer.seek();
-            } catch (_e) {
-              /* keep startPos */
-            }
+          !hasSubloops &&
+          (loopMode === "forever" ||
+            (loopMode == null && typeKeyFast !== "se" && typeKeyFast !== "me"));
+        let posFast = startPos;
+        if (buffer.seek && typeof buffer.seek === "function") {
+          try {
+            posFast = buffer.seek();
+          } catch (_e) {
+            /* keep startPos */
           }
+        }
+        if (hasSubloops) {
+          this._copySubloopState(snapshot || buffer, buffer);
+          buffer._fugsTrackKey = key;
+          this._scheduleSubloopFence(key, buffer, posFast);
+        } else if (!shouldLoopFast) {
           this._scheduleTrackEndAction(key, buffer, posFast);
         }
         this.pausedTracks.delete(key);
@@ -2481,9 +3187,12 @@
         // Restore loop mode (forever or never — repeat was handled above)
         const typeKey = (type || "").toLowerCase();
         const shouldLoop =
-          loopMode === "forever" || (loopMode == null && typeKey !== "se" && typeKey !== "me");
+          !hasSubloops &&
+          (loopMode === "forever" || (loopMode == null && typeKey !== "se" && typeKey !== "me"));
         newBuffer._fugsLoopMode =
           loopMode || (typeKey === "se" || typeKey === "me" ? "never" : "forever");
+        this._copySubloopState(snapshot || buffer, newBuffer);
+        newBuffer._fugsTrackKey = key;
 
         // Replace the buffer
         this.tracks.set(key, newBuffer);
@@ -2511,7 +3220,9 @@
         }
 
         // B04: re-arm end cleanup for one-shots (pause cancelled the old timer)
-        if (!shouldLoop) {
+        if (hasSubloops) {
+          this._scheduleSubloopFence(key, newBuffer, startPos);
+        } else if (!shouldLoop) {
           this._scheduleTrackEndAction(key, newBuffer, startPos);
         }
 
@@ -2695,6 +3406,7 @@
 
       // Cancel any pending timeouts for this track
       this._clearAllTimeouts(key);
+      this._disposeSubloopTwin(key);
 
       // Disconnect and cleanup effect chains (reuse _disposeEffectChain for proper
       // node nullification, buffer clearing, and reference cleanup on older Chromium)
@@ -2877,6 +3589,27 @@
             ? pausedSnapshot.loopRepeatsRemaining
             : buffer._fugsLoopRepeatsRemaining || 0
           : buffer._fugsLoopRepeatsRemaining || 0,
+        subloops: isPaused
+          ? pausedSnapshot && pausedSnapshot.subloops != null
+            ? pausedSnapshot.subloops
+            : buffer._fugsSubloops || null
+          : buffer._fugsSubloops || null,
+        subloopFade: isPaused
+          ? pausedSnapshot && pausedSnapshot.subloopFade != null
+            ? pausedSnapshot.subloopFade
+            : buffer._fugsSubloopFade || 0
+          : buffer._fugsSubloopFade || 0,
+        subloopCurve: isPaused
+          ? pausedSnapshot && pausedSnapshot.subloopCurve
+            ? pausedSnapshot.subloopCurve
+            : buffer._fugsSubloopCurve || "smooth"
+          : buffer._fugsSubloopCurve || "smooth",
+        subloopMeta: isPaused
+          ? !!(pausedSnapshot && pausedSnapshot.subloopMeta)
+          : !!buffer._fugsSubloopMeta,
+        subloopDefaultSwitch: isPaused
+          ? pausedSnapshot && pausedSnapshot.subloopDefaultSwitch
+          : buffer._fugsSubloopDefaultSwitch || null,
         // B06: satellite state (proximity, etc.) so save/load doesn't drop it.
         ext: this._runCaptureHooks(key),
       };
@@ -2919,6 +3652,11 @@
           state.loopMode === "repeat"
             ? state.loopRepeatsRemaining || 0
             : state.loopMode || undefined,
+        subloops: state.subloops,
+        subloopFade: state.subloopFade,
+        subloopMeta: state.subloopMeta,
+        subloopCurve: state.subloopCurve,
+        switchId: state.subloopDefaultSwitch,
       };
 
       if (this.playAudio(options)) {
@@ -3175,7 +3913,12 @@
       const { args: argsAfterPauseMode, pauseMode } = this.checkPauseMode(argsAfterPersistence);
       const { args: argsAfterStart, startTime } = this.checkStartTime(argsAfterPauseMode);
       const { args: argsAfterLoop, loop } = this.checkLoop(argsAfterStart);
-      const { args: finalArgs, curve } = this.checkCurve(argsAfterLoop);
+      const { args: argsAfterSubloop, subloops: rawSubloops, subloopMeta } = this.checkSubloops(
+        argsAfterLoop
+      );
+      const { args: argsAfterSubloopFade, subloopFade } = this.checkSubloopFade(argsAfterSubloop);
+      const { args: finalArgs, curve } = this.checkCurve(argsAfterSubloopFade);
+      const subloops = this._assignSubloopSwitches(rawSubloops, switchId);
 
       const result = {
         action: action,
@@ -3188,6 +3931,9 @@
         switchId,
         curve,
         startTime,
+        subloops,
+        subloopFade,
+        subloopMeta,
       };
 
       return result;
@@ -3710,6 +4456,9 @@
           switchId: parsed.switchId,
           curve: parsed.curve,
           startTime: parsed.startTime,
+          subloops: parsed.subloops,
+          subloopFade: parsed.subloopFade,
+          subloopMeta: parsed.subloopMeta,
         };
         return this.executeCommand(commandObj);
       }
@@ -3741,6 +4490,9 @@
      * @param {string} options.pauseMode - 'never', 'menu', 'battle', 'scene' (default 'battle')
      * @param {number} options.startTime - Start position in seconds (default 0)
      * @param {string} options.effect - Effect preset to apply
+     * @param {Array<{start:number,end:number,switchId?:number}>} options.subloops - Hold regions
+     * @param {number} options.subloopFade - Wrap crossfade seconds (default 0)
+     * @param {boolean} options.subloopMeta - Load regions from audio comments
      * @returns {boolean} Success
      */
     play(type, trackId = 1, name, options = {}) {
@@ -3758,6 +4510,11 @@
         pauseMode: opts.pauseMode != null ? opts.pauseMode : DefaultPauseMode,
         startTime: opts.startTime != null ? opts.startTime : 0,
         effect: typeof opts.effect !== "undefined" ? opts.effect : null,
+        subloops: opts.subloops,
+        subloopFade: opts.subloopFade != null ? opts.subloopFade : 0,
+        subloopMeta: !!opts.subloopMeta,
+        subloopCurve: opts.subloopCurve || opts.curve,
+        switchId: opts.switchId,
       });
     },
 
@@ -4284,9 +5041,12 @@
         switchId: parsed.switchId,
         curve: parsed.curve,
         startTime: parsed.startTime,
+        subloops: parsed.subloops,
+        subloopFade: parsed.subloopFade,
+        subloopMeta: parsed.subloopMeta,
       };
 
-      if (parsed.switchId) {
+      if (parsed.switchId && !FugsMultiTrackAudioEX._commandHasSubloops(parsed)) {
         // Switch plugin (or Core SwitchBuffer) via onSwitchGatedCommand
         const handlers = FugsMultiTrackAudioEX._switchGatedHandlers || [];
         let handled = false;
