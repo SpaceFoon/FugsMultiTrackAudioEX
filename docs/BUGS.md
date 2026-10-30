@@ -727,5 +727,5 @@ Promoted out of the old risky list (now open bugs, not dismissed): `loadGame` le
 ## Verification follow-up — 2026-10-30
 
 - Distance-muted tracks could stay silent after the listener returned, and cold or fading tracks could miss their first distance update. Proximity now retries deferred updates and distinguishes a pending fade from distance silence.
-- A ready one-shot with zero duration stopped retrying but remained tracked. The retry limit now stops and removes it.
+- A ready one-shot with zero duration stopped retrying but remained tracked. The retry limit now stops it, runs teardown while its buffer is available, and removes it.
 - The engine model now includes the menu base class, sidechain checks measure the output graph, and the example audio fixture includes BossTheme. The loop documentation and dev curve checks now match the parser.

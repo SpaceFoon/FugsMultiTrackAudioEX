@@ -2,6 +2,8 @@
 
 [Download v2.3.0 install ZIP](https://github.com/SpaceFoon/FugsMultiTrackAudioEX/releases/download/v2.3.0/FugsMultiTrackAudioEX-v2.3.0.zip) · [All releases](https://github.com/SpaceFoon/FugsMultiTrackAudioEX/releases) · [Source repository](https://github.com/SpaceFoon/FugsMultiTrackAudioEX) · [GPL-3.0 license](LICENSE)
 
+The v2.3.0 release ZIP predates the current source fixes. For those fixes, use the current modular files or the current built bundle from this repository.
+
 Unlimited BGM / BGS / ME / SE tracks for **RPG Maker MV and MZ**, with fades, crossfades, effects, spatial audio, ducking, switch-gated commands, switch-held audio subloops, and SFX aliases.
 
 The old single-file plugin is now a **Core + optional satellites** pack. Same command grammar and `FugsAudio` script API on both engines.

@@ -288,11 +288,14 @@ forEachBackend("zero-duration cleanup", (b) => {
     await play(env, "play-se1 Hit 90 (loop:forever)");
     const buffer = env.track("se_1");
     assert.ok(buffer);
+    const sourceNodes = audibleSourcesOf(env, "se_1");
+    env.run("window.__cleanupSawBuffer = false; FugsAudio.onTeardown(function (key) { if (key === 'se_1') window.__cleanupSawBuffer = this.tracks.get(key) != null; })");
     buffer._totalTime = 0;
     env.A._scheduleTrackEndAction("se_1", buffer, 0);
     await env.advance(11000);
+    assert.equal(env.run("window.__cleanupSawBuffer"), true, "teardown can still access the buffer");
     assert.equal(env.A.tracks.has("se_1"), false);
-    assert.equal(audibleSourcesOf(env, "se_1").length, 0);
+    for (const source of sourceNodes) assert.equal(source.isAudible(), false, "source is stopped");
   });
 });
 

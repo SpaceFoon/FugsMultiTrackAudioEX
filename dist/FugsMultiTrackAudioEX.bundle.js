@@ -1760,9 +1760,9 @@
           if (++notReadyRetries > AUDIO_CONSTANTS.MAX_RETRIES) {
             Logger.warn(`Audio ${key} has no playable duration; cleaning up the track`);
             this._stopBufferSafely(buffer);
-            this._releaseBuffer(buffer);
-            this.tracks.delete(key);
             this.cleanupTrack(key);
+            this.tracks.delete(key);
+            this._releaseBuffer(buffer);
             return;
           }
           const retryId = setTimeout(schedule, 200);
