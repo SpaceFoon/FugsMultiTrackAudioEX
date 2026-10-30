@@ -745,8 +745,12 @@ function Scene_Battle() {}
 Scene_Battle.prototype = Object.create(Scene_Base.prototype);
 Scene_Battle.prototype.constructor = Scene_Battle;
 
+function Scene_MenuBase() {}
+Scene_MenuBase.prototype = Object.create(Scene_Base.prototype);
+Scene_MenuBase.prototype.constructor = Scene_MenuBase;
+
 function Scene_Menu() {}
-Scene_Menu.prototype = Object.create(Scene_Base.prototype);
+Scene_Menu.prototype = Object.create(Scene_MenuBase.prototype);
 Scene_Menu.prototype.constructor = Scene_Menu;
 
 function Scene_Load() {}

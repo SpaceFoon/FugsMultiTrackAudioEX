@@ -475,7 +475,7 @@ function stopAllQuiet() {
     "B30",
     "ready buffer with _totalTime === 0 is capped or cleaned up (no infinite 200ms retry)",
     /_fugsEndActionRetries/.test(CORE) ||
-      /MAX_.*END|END_TIMER.*MAX|_endTimerRetries|totalTimeRetries|retryCount/.test(CORE) ||
+      /MAX_.*END|END_TIMER.*MAX|_endTimerRetries|totalTimeRetries|notReadyRetries|retryCount/.test(CORE) ||
       !(Array.isArray(retries) && retries.length > 0)
   );
   seBuf._fugsManualStop = true;
@@ -1088,11 +1088,11 @@ function stopAllQuiet() {
 
 {
   ok(
-    "N22 TRUE — playbook optional-tags list has (p:) (pause:) (start:) but not (loop:)",
+    "N22 TRUE — playbook documents the loop and other playback tags",
     /\(p:none\|scene\|battle\|always\)/.test(DOCS) &&
       /\(pause:never\|menu\|battle\|scene\)/.test(DOCS) &&
       /\(start:seconds\)/.test(DOCS) &&
-      !/\(loop:/.test(DOCS)
+      /\(loop:forever\|never\|N\)/.test(DOCS)
   );
   ok("N22 TRUE — parser still supports (loop:)", A.checkLoop(["(loop:forever)"]).loop === "forever");
 }

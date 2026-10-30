@@ -87,7 +87,7 @@ function consoleTestCalls() {
 async function richBoot(b) {
   const env = await createEnv(b.cfg);
   env.addDefaultAudio();
-  ["NewSong", "Drums", "Bass", "Lead", "Pads", "ThemeSong", "Exploration", "Forest_Ambience", "kick", "bass"].forEach((n) =>
+  ["NewSong", "Drums", "Bass", "Lead", "Pads", "ThemeSong", "Exploration", "Forest_Ambience", "kick", "bass", "BossTheme"].forEach((n) =>
     env.addAudio("bgm", n, { duration: 30 })
   );
   ["Rain", "Waterfall", "Wind"].forEach((n) => env.addAudio("bgs", n, { duration: 20 }));

@@ -282,6 +282,20 @@ forEachBackend("pause and resume", (b) => {
   });
 });
 
+forEachBackend("zero-duration cleanup", (b) => {
+  it("removes a ready track that never obtains a duration after the retry limit", async () => {
+    const env = await boot(b);
+    await play(env, "play-se1 Hit 90 (loop:forever)");
+    const buffer = env.track("se_1");
+    assert.ok(buffer);
+    buffer._totalTime = 0;
+    env.A._scheduleTrackEndAction("se_1", buffer, 0);
+    await env.advance(11000);
+    assert.equal(env.A.tracks.has("se_1"), false);
+    assert.equal(audibleSourcesOf(env, "se_1").length, 0);
+  });
+});
+
 forEachBackend("stems and global commands", (b) => {
   it("syncplay-bgm S1 S2 S3 90 60 0 starts three stems together at the given volumes", async () => {
     const env = await boot(b);

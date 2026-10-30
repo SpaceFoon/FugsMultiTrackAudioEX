@@ -215,13 +215,8 @@
 
     if (typeof buffer.isReady === "function" && !buffer.isReady()) return true;
 
-    const manual =
-      buffer._manualVolume !== undefined && buffer._manualVolume !== null
-        ? buffer._manualVolume
-        : buffer._originalVolume;
-    if (buffer.volume === 0 && typeof manual === "number" && isFinite(manual) && manual > 0) {
-      return true;
-    }
+    // Silence can be caused by distance; only defer for an actual pending fade.
+    if (buffer._fugsFadeInPending) return true;
 
     return false;
   };
@@ -546,7 +541,10 @@
         }
 
         // B36: skip volume writes while cold, fade-in is pending, or a fade is active.
-        if (!this._shouldSkipProximityVolumeWrite(key, buffer)) {
+        if (this._shouldSkipProximityVolumeWrite(key, buffer)) {
+          // Retry on the next update even when source and listener do not move.
+          config.lastSourceX = undefined;
+        } else {
           const baseVolumeCandidate =
             buffer._manualVolume !== undefined && buffer._manualVolume !== null
               ? buffer._manualVolume

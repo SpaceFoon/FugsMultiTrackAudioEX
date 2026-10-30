@@ -141,7 +141,7 @@ Full playbook: enable `FugsAudio0Docs` and open it in Plugin Manager.
 
 - Fugs tracks play at the volume you give them and **ignore the Options-menu BGM/BGS/ME/SE sliders** (the engine's master volume still applies).
 - Entering a battle follows the persistence × pause table in `FugsAudio0Docs` (Continues / Pauses / Stops). Tracks that *Pause* come back where they left off when the battle ends, and tracks that Pause or Continue are still there afterwards; a `(p:none)` track started *during* the battle ends with it. `(pause:scene)` tracks resume automatically at the next map scene.
-- There is no automatic stop on **Game Over** (the title screen does stop tracks); stop them yourself if you need silence there.
+- Entering **Game Over** or the title screen stops Fugs tracks automatically.
 - Effects requested before a file has finished loading are applied automatically once it starts playing.
 - A missing file logs `Could not load audio/<type>/<name>` and the track slot is freed.
 - `(subloop:start-end)` with `switch:N` holds a song region while the switch is ON, then lets the track reach its outro; see the playbook's section 5.12.

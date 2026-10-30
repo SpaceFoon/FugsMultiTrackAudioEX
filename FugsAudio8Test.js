@@ -3682,14 +3682,14 @@ TestRunner.add("unit:consumeParenTag", async function () {
     assertEq(r.curve, "ease-in-out", "curve:ease-in-out");
   }
   {
-    // Invalid curve name -> default smooth
+    // No explicit curve lets the command handler apply its default.
     const r = FugsAudio.checkCurve(["50", "(curve:banana)"]);
-    assertEq(r.curve, "smooth", "invalid curve = smooth default");
+    assertEq(r.curve, undefined, "invalid curve has no explicit override");
   }
   {
-    // No curve tag -> default smooth
+    // No tag leaves positional curve detection available to the command handler.
     const r = FugsAudio.checkCurve(["50", "2"]);
-    assertEq(r.curve, "smooth", "no curve = smooth default");
+    assertEq(r.curve, undefined, "no tag has no explicit curve override");
   }
 
   // --- checkPersistence ---

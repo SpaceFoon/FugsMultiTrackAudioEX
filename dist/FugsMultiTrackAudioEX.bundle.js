@@ -1757,7 +1757,14 @@
         if (totalTime <= 0) {
           // Decoded but duration not known yet: retry briefly (bounded — _watchLoad reports
           // buffers that never become playable).
-          if (++notReadyRetries > AUDIO_CONSTANTS.MAX_RETRIES) return;
+          if (++notReadyRetries > AUDIO_CONSTANTS.MAX_RETRIES) {
+            Logger.warn(`Audio ${key} has no playable duration; cleaning up the track`);
+            this._stopBufferSafely(buffer);
+            this._releaseBuffer(buffer);
+            this.tracks.delete(key);
+            this.cleanupTrack(key);
+            return;
+          }
           const retryId = setTimeout(schedule, 200);
           this._trackTimeout(key, retryId, "endAction");
           return;
@@ -2582,6 +2589,7 @@
 
         this.tracks.set(key, buffer);
 
+        buffer._fugsFadeInPending = fadein > 0;
         buffer.volume = Math.max(0, Math.min(1, fadein > 0 ? 0 : volume / 100));
         buffer.pan = Math.max(-1, Math.min(1, pan / 100));
 
@@ -2631,8 +2639,9 @@
             `applyFadeIn callback triggered for ${key} (fadein: ${fadein}, buffer match: ${this.tracks.get(key) === buffer})`
           );
 
-          if (fadein > 0 && this.tracks.get(key) === buffer) {
-            this.fadeAudio(type, trackId, { volume, duration: fadein });
+          if (this.tracks.get(key) === buffer) {
+            buffer._fugsFadeInPending = false;
+            if (fadein > 0) this.fadeAudio(type, trackId, { volume, duration: fadein });
           }
 
           // Initialize proximity volume if configured
@@ -7930,13 +7939,8 @@
 
     if (typeof buffer.isReady === "function" && !buffer.isReady()) return true;
 
-    const manual =
-      buffer._manualVolume !== undefined && buffer._manualVolume !== null
-        ? buffer._manualVolume
-        : buffer._originalVolume;
-    if (buffer.volume === 0 && typeof manual === "number" && isFinite(manual) && manual > 0) {
-      return true;
-    }
+    // Silence can be caused by distance; only defer for an actual pending fade.
+    if (buffer._fugsFadeInPending) return true;
 
     return false;
   };
@@ -8261,7 +8265,10 @@
         }
 
         // B36: skip volume writes while cold, fade-in is pending, or a fade is active.
-        if (!this._shouldSkipProximityVolumeWrite(key, buffer)) {
+        if (this._shouldSkipProximityVolumeWrite(key, buffer)) {
+          // Retry on the next update even when source and listener do not move.
+          config.lastSourceX = undefined;
+        } else {
           const baseVolumeCandidate =
             buffer._manualVolume !== undefined && buffer._manualVolume !== null
               ? buffer._manualVolume

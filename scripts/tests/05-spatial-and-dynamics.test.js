@@ -35,6 +35,28 @@ forEachBackend("proximity", (b) => {
     near(gainOf(env, "bgs_1"), 0, 0.02, "beyond maxDistance is silent");
   });
 
+  it("a sound becomes audible again when the player returns from out of range", async () => {
+    const env = await boot(b);
+    setEvent(env, 5, 10, 5);
+    setPlayer(env, 25, 5);
+    await play(env, "play-bgs1 Waterfall 100");
+    await env.runCommand("proximity-bgs1 {event:5, maxDistance:10}");
+    await env.advance(100);
+    near(gainOf(env, "bgs_1"), 0, 0.02);
+    setPlayer(env, 5, 5);
+    await env.advance(100);
+    near(gainOf(env, "bgs_1"), 0.5, 0.02, "sound recovers after returning");
+  });
+
+  it("applies proximity after a cold fade completes even if nobody moves", async () => {
+    const env = await boot(b, { envOpts: { decodeDelayMs: 500 } });
+    setPlayer(env, 5, 5);
+    await env.runCommand("play-bgs1 Waterfall 100 1");
+    await env.runCommand("proximity-bgs1 {x:10, y:5, maxDistance:10}");
+    await env.advance(2200);
+    near(gainOf(env, "bgs_1"), 0.5, 0.02, "stationary sound uses distance after fade");
+  });
+
   it("an event that moves while the player stands still updates the volume", async () => {
     const env = await boot(b);
     setEvent(env, 5, 10, 5);
@@ -300,11 +322,14 @@ forEachBackend("pump and sidechain", (b) => {
     await env.settle();
     await env.runCommand("sidechain-bgm 1 2 0.05 1 0.01 0.05");
     await env.advance(500);
-    const ducked = gainOf(env, "bgm_2");
-    assert.ok(ducked < 0.7, "target ducked by the loud source, got " + ducked);
+    const target = env.track("bgm_2");
+    assert.ok(env.audio.pathExists(target._gainNode, target._sidechainGainNode));
+    assert.ok(env.audio.pathExists(target._sidechainGainNode, target._pannerNode));
+    const ducked = env.audio.levelAt(target._pannerNode);
+    assert.ok(ducked < 0.35, "target output ducked by the loud source, got " + ducked);
     await env.runCommand("stopsidechain-bgm 1 2");
     await env.advance(200);
-    near(gainOf(env, "bgm_2"), 0.9, 0.01, "target restored after stopsidechain");
+    near(env.audio.levelAt(target._pannerNode), 0.45, 0.01, "target output restored after stopsidechain");
   });
 
   it("sidechain-bgm kick bass ...: the documented example (file names instead of ids) works", async () => {
@@ -314,10 +339,14 @@ forEachBackend("pump and sidechain", (b) => {
     await env.settle();
     await env.runCommand("sidechain-bgm kick bass 0.05 1 0.01 0.05");
     await env.advance(500);
-    assert.ok(gainOf(env, "bgm_2") < 0.7, "target ducked, got " + gainOf(env, "bgm_2"));
+    const target = env.track("bgm_2");
+    assert.ok(env.audio.pathExists(target._gainNode, target._sidechainGainNode));
+    assert.ok(env.audio.pathExists(target._sidechainGainNode, target._pannerNode));
+    const ducked = env.audio.levelAt(target._pannerNode);
+    assert.ok(ducked < 0.35, "target output ducked, got " + ducked);
     await env.runCommand("stopsidechain-bgm kick bass");
     await env.advance(200);
-    near(gainOf(env, "bgm_2"), 0.9, 0.01, "restored");
+    near(env.audio.levelAt(target._pannerNode), 0.45, 0.01, "target output restored");
   });
 
   it("re-issuing a sidechain replaces it (no duplicate followers)", async () => {

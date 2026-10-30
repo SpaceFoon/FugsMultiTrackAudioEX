@@ -405,7 +405,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 **Triggers:** `syncplay-bgm Drums Bass Pads Lead` on a cold cache (decode finish order differs).
 
-**Fix:** After `play()`, if `_sourceNode` exists, stop and re-`start(when)` at the scheduled time; or wait until all are ready, then start in one block.
+**Fix:** Wait for all stems. On MV, schedule a fresh source node at the common start time; a Web Audio source cannot be started twice. MZ uses its engine playback path.
 
 ---
 
@@ -675,10 +675,10 @@ Re-checked against current source on 2026-08-13. These were investigated (often 
 | N19 | Effects `init()` at satellite load | `FugsAudio2Effects` calls `AudioEffects.init()` at load; `applyEffect` also lazy-grabs context if init ran too early. |
 | N20 | Fugs does not mute MV BGM | Separate mixer from `AudioManager.playBgm`. By design; Play BGM event commands still work alongside Fugs tracks. |
 | N21 | Docs `sidechain-bgm 1 2` | `setupSidechain` reads `args[0]` / `args[1]` as source/target and looks up `bgm_${id}` only. `sidechain-bgm 1 2` is correct. `sidechain-bgm1 2 3` sourcing 2→3 is a footgun, not a docs/code mismatch. BGM-only is intentional. |
-| N22 | Playbook omitting `(loop:)` | Parser + `playAudio` support `(loop:forever\|never\|N)`. `FugsAudio0Docs` optional-tags list is `(p:)`, `(pause:)`, `(start:)` only. Docs gap, not a runtime drop (that drop was **B02**, fixed). |
+| N22 | Playbook loop documentation | The parser and `playAudio` support `(loop:forever\|never\|N)`; the playbook now lists the tag with the other playback options. |
 | N23 | Crossfade `_manualVolume` window | Incoming `playAudio` at volume 0 sets `_originalVolume` to 0 until fade-in writes `_manualVolume`. Same family as **B36** (cold + proximity). Not a separate crossfade bug. |
 | N24 | Alias `persistence: none` | `playAlias` hard-sets `persistence: "none"`, `pauseMode: "never"`. Correct for one-shot SFX. |
-| N25 | `_syncGroup = Date.now()` | Tag is log-only. `startSyncedBuffers` never uses the 50ms `startTime` it computes (**B28**). The unused timestamp is not a second bug. |
+| N25 | `_syncGroup = Date.now()` | The group tag is for logging. On MV, `startSyncedBuffers` schedules fresh source nodes at the common 50ms start time (**B28**). |
 | N26 | Positional play start (6th arg) | `checkStartTime` defaults to `0` (falsy), so `commandObject.startTime \|\| toNum(args[5], 0)` still reads a positional offset. Contrast **B40**, where default `"smooth"` is truthy. |
 | N27 | Pump vs proximity gain | Proximity writes `buffer.volume` (gain). Pump writes `_pumpGainNode.gain` after gain. They multiply. Sidechain fighting `buffer.volume` is **B27**; pump layering is intended. |
 | N28 | Core `duckpump` switch-case | `_registerCoreLifecycle` registers a soft stub (or Dynamics overwrites it). `executeCommand` hits `_handlers` first. The switch-case body is dead leftover, not a double-start. |
@@ -723,3 +723,9 @@ Promoted out of the old risky list (now open bugs, not dismissed): `loadGame` le
 7. **B24 / B36 / B40** — Switch OFF play-only; fade-in vs proximity on cold buffers; positional fade curve dead.
 8. **B28–B30 / B39 / B41 / B43** — syncPlay timing, dashless type, missing-file timer leak, delay maxDelay, alias cooldown on failed play / first-play `now < cooldown`.
 9. **B45 / B46** — cold paused+proximity double attenuation; syncPlay ignores scene policy tags.
+
+## Verification follow-up — 2026-10-30
+
+- Distance-muted tracks could stay silent after the listener returned, and cold or fading tracks could miss their first distance update. Proximity now retries deferred updates and distinguishes a pending fade from distance silence.
+- A ready one-shot with zero duration stopped retrying but remained tracked. The retry limit now stops and removes it.
+- The engine model now includes the menu base class, sidechain checks measure the output graph, and the example audio fixture includes BossTheme. The loop documentation and dev curve checks now match the parser.

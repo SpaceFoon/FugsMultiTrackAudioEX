@@ -348,6 +348,23 @@ async function createEnv(opts) {
       DataManager.makeSavefileInfo = function () { return {}; };
       DataManager.correctDataErrors = function () {};
     `);
+    if (engineKind === "mv") {
+      // MV uses synchronous save/load methods; MZ's saveObject/loadObject mocks
+      // do not replace those APIs.
+      run(`
+        StorageManager.save = function (id, json) { this._files[id] = json; };
+        StorageManager.load = function (id) {
+          if (!Object.prototype.hasOwnProperty.call(this._files, id)) throw new Error('no such save');
+          return this._files[id];
+        };
+        StorageManager.exists = function (id) { return Object.prototype.hasOwnProperty.call(this._files, id); };
+        StorageManager.remove = function (id) { delete this._files[id]; };
+        StorageManager.backup = function () {};
+        StorageManager.restoreBackup = function () {};
+        StorageManager.isLocalMode = function () { return true; };
+        DataManager.saveGlobalInfo = function (info) { StorageManager.save(0, JSON.stringify(info)); };
+      `);
+    }
     // Heavy scene methods (rendering, windows) are replaced by no-ops BEFORE the plugins
     // wrap them. We first assert the methods exist in the real engine, because the
     // plugins depend on exactly these prototype methods.
@@ -378,8 +395,10 @@ async function createEnv(opts) {
       Scene_Map.prototype.update = function () {};
       Scene_Map.prototype.terminate = function () {};
       Scene_Battle.prototype.terminate = function () {};
-      Scene_Menu.prototype.start = function () {};
-      Scene_Menu.prototype.terminate = function () {};
+      Scene_MenuBase.prototype.start = function () {};
+      Scene_MenuBase.prototype.terminate = function () {};
+      Scene_Menu.prototype.start = function () { Scene_MenuBase.prototype.start.call(this); };
+      Scene_Menu.prototype.terminate = function () { Scene_MenuBase.prototype.terminate.call(this); };
     `);
   }
 

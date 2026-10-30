@@ -1758,7 +1758,14 @@
         if (totalTime <= 0) {
           // Decoded but duration not known yet: retry briefly (bounded — _watchLoad reports
           // buffers that never become playable).
-          if (++notReadyRetries > AUDIO_CONSTANTS.MAX_RETRIES) return;
+          if (++notReadyRetries > AUDIO_CONSTANTS.MAX_RETRIES) {
+            Logger.warn(`Audio ${key} has no playable duration; cleaning up the track`);
+            this._stopBufferSafely(buffer);
+            this._releaseBuffer(buffer);
+            this.tracks.delete(key);
+            this.cleanupTrack(key);
+            return;
+          }
           const retryId = setTimeout(schedule, 200);
           this._trackTimeout(key, retryId, "endAction");
           return;
@@ -2583,6 +2590,7 @@
 
         this.tracks.set(key, buffer);
 
+        buffer._fugsFadeInPending = fadein > 0;
         buffer.volume = Math.max(0, Math.min(1, fadein > 0 ? 0 : volume / 100));
         buffer.pan = Math.max(-1, Math.min(1, pan / 100));
 
@@ -2632,8 +2640,9 @@
             `applyFadeIn callback triggered for ${key} (fadein: ${fadein}, buffer match: ${this.tracks.get(key) === buffer})`
           );
 
-          if (fadein > 0 && this.tracks.get(key) === buffer) {
-            this.fadeAudio(type, trackId, { volume, duration: fadein });
+          if (this.tracks.get(key) === buffer) {
+            buffer._fugsFadeInPending = false;
+            if (fadein > 0) this.fadeAudio(type, trackId, { volume, duration: fadein });
           }
 
           // Initialize proximity volume if configured
