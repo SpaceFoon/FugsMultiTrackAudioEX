@@ -1708,53 +1708,9 @@
     _scheduleTrackEndAction(key, buffer, offsetSeconds = 0) {
       if (!buffer || !key) return;
 
-<<<<<<< HEAD
-      const schedule = () => {
-        if (this.tracks.get(key) !== buffer) return;
-        if (buffer._fugsManualStop) return;
-
-        const totalTime = typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
-        const pitchNow =
-          typeof buffer._pitch === "number" && buffer._pitch > 0 ? buffer._pitch : 1;
-
-        if (totalTime <= 0) {
-          buffer._fugsEndActionRetries = (buffer._fugsEndActionRetries || 0) + 1;
-          if (buffer._fugsEndActionRetries > 50) {
-            Logger.warn(
-              `End timer gave up for ${key} after 50 retries (_totalTime=${totalTime}) — cleaning up`
-            );
-            this.cleanupTrack(key);
-            this.tracks.delete(key);
-            return;
-          }
-          const retryId = setTimeout(schedule, 200);
-          this._trackTimeout(key, retryId, "endAction");
-          return;
-        }
-
-        buffer._fugsEndActionRetries = 0;
-        const remaining = Math.max(0, totalTime - (offsetSeconds || 0));
-        const delayMs = Math.max(50, (remaining / pitchNow) * 1000 + 60);
-=======
-      const trackTimeout = (timeoutId) => {
-        if (!this.activeTimeouts.has(key)) {
-          this.activeTimeouts.set(key, []);
-        }
-        this.activeTimeouts.get(key).push(timeoutId);
-      };
-
-      const removeTrackedTimeout = (timeoutId) => {
-        if (!this.activeTimeouts.has(key)) return;
-        const list = this.activeTimeouts.get(key);
-        const index = list.indexOf(timeoutId);
-        if (index > -1) list.splice(index, 1);
-        if (list.length === 0) this.activeTimeouts.delete(key);
-      };
-
       let notReadyRetries = 0;
 
       const arm = (delayMs) => {
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
         const timeoutId = setTimeout(() => {
           this._removeTrackedTimeout(key, timeoutId);
           if (this.tracks.get(key) !== buffer) return;
@@ -1806,7 +1762,7 @@
           // buffers that never become playable).
           if (++notReadyRetries > AUDIO_CONSTANTS.MAX_RETRIES) return;
           const retryId = setTimeout(schedule, 200);
-          trackTimeout(retryId);
+          this._trackTimeout(key, retryId, "endAction");
           return;
         }
 
@@ -1826,7 +1782,6 @@
       schedule();
     },
 
-<<<<<<< HEAD
     _commandHasSubloops(parsed) {
       if (!parsed) return false;
       if (parsed.subloopMeta) return true;
@@ -2463,7 +2418,8 @@
         return;
       }
       startTicks();
-=======
+    },
+
     /** Wall-clock milliseconds of audio left in `buffer` at its current speed (0 if unknown). */
     _remainingPlaybackMs(buffer) {
       const total = buffer && typeof buffer._totalTime === "number" ? buffer._totalTime : 0;
@@ -2525,7 +2481,6 @@
       };
 
       check();
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
     },
 
     playAudio(options) {
@@ -4452,9 +4407,12 @@
         switchId: parsed.switchId,
         curve: parsed.curve,
         startTime: parsed.startTime,
+        subloops: parsed.subloops,
+        subloopFade: parsed.subloopFade,
+        subloopMeta: parsed.subloopMeta,
       };
 
-      if (parsed.switchId) {
+      if (parsed.switchId && !this._commandHasSubloops(parsed)) {
         // Switch plugin (or Core SwitchBuffer) via onSwitchGatedCommand
         const handlers = this._switchGatedHandlers || [];
         let handled = false;
@@ -4586,16 +4544,11 @@
           const [type, trackId] = key.split("_");
           const wasPaused = this.pausedTracks.has(key);
           this.pauseAudio(type, trackId, [fadeoutDuration]);
-<<<<<<< HEAD
-          // B18: mark scene auto-pauses so map start can resume without waking saved-as-paused tracks
-          if (pauseMode === "scene" && transitionType === "scene") {
-            const snap = this.pausedSnapshots.get(key);
             if (snap) snap._autoScenePause = true;
-=======
+          }
           // Remember scene-change pauses so the next map scene can bring them back.
           if ((transitionType === "scene" || transitionType === "afterBattle") && !wasPaused) {
             this._scenePausedKeys.add(key);
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
           }
         } else if (shouldStop) {
           const [type, trackId] = key.split("_");
@@ -5548,57 +5501,7 @@
         }
       }
 
-<<<<<<< HEAD
-      const parsed = FugsMultiTrackAudioEX.parseCommand(command, args);
-      if (!parsed) return;
-
-      const commandObj = {
-        type: parsed.type,
-        trackId: parsed.trackId,
-        action: parsed.action,
-        args: parsed.args,
-        loop: parsed.loop,
-        effect: parsed.effect,
-        persistence: parsed.persistence,
-        pauseMode: parsed.pauseMode,
-        switchId: parsed.switchId,
-        curve: parsed.curve,
-        startTime: parsed.startTime,
-        subloops: parsed.subloops,
-        subloopFade: parsed.subloopFade,
-        subloopMeta: parsed.subloopMeta,
-      };
-
-      if (parsed.switchId && !FugsMultiTrackAudioEX._commandHasSubloops(parsed)) {
-        // Switch plugin (or Core SwitchBuffer) via onSwitchGatedCommand
-        const handlers = FugsMultiTrackAudioEX._switchGatedHandlers || [];
-        let handled = false;
-        for (let i = 0; i < handlers.length; i++) {
-          try {
-            if (handlers[i].call(FugsMultiTrackAudioEX, parsed.switchId, commandObj)) {
-              handled = true;
-              break;
-            }
-          } catch (e) {
-            Logger.error("onSwitchGatedCommand failed", {
-              error: e && e.message ? e.message : e,
-            });
-          }
-        }
-        if (!handled) {
-          Logger.warn(
-            "switch:" +
-              parsed.switchId +
-              " present but no switch handler — executing immediately"
-          );
-          FugsMultiTrackAudioEX.executeCommand(commandObj);
-        }
-        return;
-      }
-      FugsMultiTrackAudioEX.executeCommand(commandObj);
-=======
       FugsMultiTrackAudioEX.runPluginCommand(command, args);
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
     };
 
     if (Engine.isMZ && typeof Game_Interpreter.prototype.command356 === "function") {
@@ -7032,7 +6935,6 @@
   };
 
   // --- Track-level effect integration (lives on hub) ---
-<<<<<<< HEAD
   // Send effects tap the wet bus; everything else is 100% in-series on the main path.
   const SEND_EFFECT_TYPES = {
     reverb: true,
@@ -7086,36 +6988,41 @@
       return { connected: false, queued: false };
     }
 
-    if (!this._effectConnectGen) this._effectConnectGen = new Map();
-    const connectGen = (this._effectConnectGen.get(key) || 0) + 1;
-    this._effectConnectGen.set(key, connectGen);
-
-    const self = this;
-    buffer.addLoadListener(function onEffectBufferReady() {
-      if (self._effectConnectGen.get(key) !== connectGen) return;
-      if (!self.effectChains.has(key)) return;
-      const currentBuffer = self.tracks.get(key);
-      if (!currentBuffer) return;
-      self.connectEffectChain(key, currentBuffer);
-    });
-
-    Logger.effect(`Queued effect-chain connect for ${key} until buffer is ready`);
+    this._deferEffectConnect(key, buffer);
+    Logger.effect("Queued effect-chain connect for " + key + " until buffer is ready");
     return { connected: false, queued: true };
-=======
+  };
 
-  // The audio file is still loading (no source nodes yet): connect the chain as soon as the
-  // engine has started playing. The engine's own play() load-listener was registered first, so
-  // by the time this one runs the source/gain nodes exist.
+  // Wait for the engine's play() listener to create source/gain nodes before connecting effects.
   hub._deferEffectConnect = function(key, buffer) {
-      if (!buffer || typeof buffer.addLoadListener !== "function") return;
-      if (buffer._fugsEffectConnectPending) return;
-      buffer._fugsEffectConnectPending = true;
-      buffer.addLoadListener(() => {
-        buffer._fugsEffectConnectPending = false;
-        if (this.tracks.get(key) !== buffer || !this.effectChains.has(key)) return;
-        this.connectEffectChain(key, buffer);
-      });
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
+    if (!buffer || typeof buffer.addLoadListener !== "function") return;
+    if (!this._effectConnectGen) this._effectConnectGen = new Map();
+
+    const currentGen = this._effectConnectGen.get(key) || 0;
+    const pending = buffer._fugsEffectConnectPending;
+    if (
+      pending &&
+      pending.hub === this &&
+      pending.key === key &&
+      pending.gen === currentGen
+    ) {
+      return;
+    }
+
+    const connectGen = currentGen + 1;
+    this._effectConnectGen.set(key, connectGen);
+    const pendingMarker = { hub: this, key, gen: connectGen };
+    buffer._fugsEffectConnectPending = pendingMarker;
+    const self = this;
+
+    buffer.addLoadListener(function onEffectBufferReady() {
+      if (buffer._fugsEffectConnectPending === pendingMarker) {
+        delete buffer._fugsEffectConnectPending;
+      }
+      if (self._effectConnectGen.get(key) !== connectGen) return;
+      if (self.tracks.get(key) !== buffer || !self.effectChains.has(key)) return;
+      self.connectEffectChain(key, buffer);
+    });
   };
 
   hub.connectEffectChain = function(key, buffer) {
@@ -8847,8 +8754,6 @@
       }
 
       try {
-<<<<<<< HEAD
-=======
         let level = 1.0;
         if (buffer._pumpGainNode) {
           try {
@@ -8864,17 +8769,15 @@
         }
 
         // Create pump gain node
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
         buffer._pumpGainNode = WebAudio._context.createGain();
         buffer._pumpGainNode.gain.value = level;
 
-<<<<<<< HEAD
         const gain = buffer._gainNode;
         const panner = buffer._pannerNode;
         const sidechain = buffer._sidechainGainNode;
         const pump = buffer._pumpGainNode;
 
-        // B23: disconnect only the audibility edge, not every gain output (preserves analyser taps).
+        // Preserve the sidechain multiplier in the main path and leave analyser taps connected.
         if (sidechain) {
           try {
             sidechain.disconnect(panner);
@@ -8894,24 +8797,8 @@
         }
         pump.connect(panner);
         this._reconnectSidechainAnalyserTaps(buffer);
-=======
-        // Insert: gainNode -> pumpGainNode -> pannerNode
-        // Only the gain -> panner link is replaced (a no-argument disconnect() would also cut
-        // other taps on the gain node, e.g. a sidechain analyser).
-        try {
-          buffer._gainNode.disconnect(buffer._pannerNode);
-        } catch (_) {
-          Logger.debugOnce(
-            "ensurePumpNode: gainNode already disconnected",
-            {},
-            "ensurePumpNode.disconnectGain"
-          );
-        }
-        buffer._gainNode.connect(buffer._pumpGainNode);
-        buffer._pumpGainNode.connect(buffer._pannerNode);
-        buffer._pumpWiredGain = buffer._gainNode;
-        buffer._pumpWiredPanner = buffer._pannerNode;
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
+        buffer._pumpWiredGain = gain;
+        buffer._pumpWiredPanner = panner;
 
         return true;
       } catch (e) {
@@ -9356,7 +9243,6 @@
           )}% -> ${Math.round(duckedVolume * 100)}% for ${holdTime}s`
         );
 
-<<<<<<< HEAD
         const duckGen = (buffer._duckGen || 0) + 1;
         buffer._duckGen = duckGen;
         buffer._duckRestoreVolume = restoreVolume;
@@ -9384,51 +9270,6 @@
             Logger.success(`Duck phase complete for ${key}, holding for ${holdTime}s`);
             const holdId = setTimeout(runRestore, holdTime * 1000);
             this._trackDuckRestoreTimeout(key, holdId);
-=======
-        this.fadeAudio(type, trackId, { volume: duckedVolume * 100, duration: fadeTime }, () => {
-          if (holdTime > 0) {
-            Logger.success(`Duck phase complete for ${key}, holding for ${holdTime}s`);
-            const timeoutId = setTimeout(() => {
-              // Check if track still exists and wasn't replaced
-              const currentBuffer = this.tracks.get(key);
-              if (!currentBuffer) {
-                Logger.warn(`Duck restore cancelled - track ${key} no longer exists`);
-                return;
-              }
-
-              if (currentBuffer !== buffer) {
-                Logger.warn(`Duck restore cancelled - track ${key} was replaced`);
-                return;
-              }
-
-              Logger.info(
-                `Starting duck restore for ${key}: ${
-                  Math.round(duckedVolume * 100)
-                }% -> ${Math.round(restoreVolume * 100)}%`
-              );
-              this.fadeAudio(
-                type,
-                trackId,
-                { volume: restoreVolume * 100, duration: fadeTime },
-                () => {
-                  Logger.success(`Duck restore complete for ${key}`);
-                  // Remove timeout from tracking
-                  if (this.activeTimeouts.has(key)) {
-                    const timeouts = this.activeTimeouts.get(key);
-                    const index = timeouts.indexOf(timeoutId);
-                    if (index > -1) timeouts.splice(index, 1);
-                    if (timeouts.length === 0) this.activeTimeouts.delete(key);
-                  }
-                }
-              );
-            }, holdTime * 1000);
-
-            // Track this timeout for cleanup
-            if (!this.activeTimeouts.has(key)) {
-              this.activeTimeouts.set(key, []);
-            }
-            this.activeTimeouts.get(key).push(timeoutId);
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
           }
         });
       }
@@ -10678,14 +10519,8 @@
         return false;
       }
 
-<<<<<<< HEAD
       // Cooldown check — missing entry means never played (B43)
       if (config.cooldown > 0 && this.aliasLastPlayed.has(aliasName)) {
-=======
-      // Cooldown check
-      if (config.cooldown > 0) {
-        // First play is never on cooldown (performance.now() can be < cooldown right at startup)
->>>>>>> 4d1bbd23832d384861aefd7b121b71c05f3c267f
         const lastPlayed = this.aliasLastPlayed.get(aliasName);
         const now = performance.now();
         if (lastPlayed !== undefined && now - lastPlayed < config.cooldown) {
