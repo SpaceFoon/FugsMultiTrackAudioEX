@@ -4542,10 +4542,10 @@
           const [type, trackId] = key.split("_");
           const wasPaused = this.pausedTracks.has(key);
           this.pauseAudio(type, trackId, [fadeoutDuration]);
-            if (snap) snap._autoScenePause = true;
-          }
           // Remember scene-change pauses so the next map scene can bring them back.
           if ((transitionType === "scene" || transitionType === "afterBattle") && !wasPaused) {
+            const snap = this.pausedSnapshots.get(key);
+            if (snap) snap._autoScenePause = true;
             this._scenePausedKeys.add(key);
           }
         } else if (shouldStop) {

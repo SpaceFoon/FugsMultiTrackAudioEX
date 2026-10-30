@@ -4544,10 +4544,10 @@
           const [type, trackId] = key.split("_");
           const wasPaused = this.pausedTracks.has(key);
           this.pauseAudio(type, trackId, [fadeoutDuration]);
-            if (snap) snap._autoScenePause = true;
-          }
           // Remember scene-change pauses so the next map scene can bring them back.
           if ((transitionType === "scene" || transitionType === "afterBattle") && !wasPaused) {
+            const snap = this.pausedSnapshots.get(key);
+            if (snap) snap._autoScenePause = true;
             this._scenePausedKeys.add(key);
           }
         } else if (shouldStop) {
@@ -9265,7 +9265,7 @@
           this._trackDuckRestoreTimeout(key, safetyId);
         }
 
-        this.fadeAudio(type, trackId, { volume: duckLevel * 100, duration: fadeTime }, () => {
+        this.fadeAudio(type, trackId, { volume: duckedVolume * 100, duration: fadeTime }, () => {
           if (holdTime > 0) {
             Logger.success(`Duck phase complete for ${key}, holding for ${holdTime}s`);
             const holdId = setTimeout(runRestore, holdTime * 1000);
@@ -10666,7 +10666,9 @@
   // Persist alias configs (not cooldowns) across save/load via __fugsMeta (B22).
   hub.onCaptureGlobalState(function () {
     if (!this.sfxAliases || this.sfxAliases.size === 0) return undefined;
-    return { sfxAliases: Object.fromEntries(this.sfxAliases) };
+    const aliases = Object.create(null);
+    this.sfxAliases.forEach((config, name) => { aliases[name] = config; });
+    return { sfxAliases: aliases };
   });
 
   hub.onRestoreGlobalState(function (meta) {

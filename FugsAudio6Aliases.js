@@ -229,7 +229,9 @@
   // Persist alias configs (not cooldowns) across save/load via __fugsMeta (B22).
   hub.onCaptureGlobalState(function () {
     if (!this.sfxAliases || this.sfxAliases.size === 0) return undefined;
-    return { sfxAliases: Object.fromEntries(this.sfxAliases) };
+    const aliases = Object.create(null);
+    this.sfxAliases.forEach((config, name) => { aliases[name] = config; });
+    return { sfxAliases: aliases };
   });
 
   hub.onRestoreGlobalState(function (meta) {

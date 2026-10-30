@@ -662,7 +662,7 @@
           this._trackDuckRestoreTimeout(key, safetyId);
         }
 
-        this.fadeAudio(type, trackId, { volume: duckLevel * 100, duration: fadeTime }, () => {
+        this.fadeAudio(type, trackId, { volume: duckedVolume * 100, duration: fadeTime }, () => {
           if (holdTime > 0) {
             Logger.success(`Duck phase complete for ${key}, holding for ${holdTime}s`);
             const holdId = setTimeout(runRestore, holdTime * 1000);
