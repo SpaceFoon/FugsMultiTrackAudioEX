@@ -1,4 +1,4 @@
-﻿//=======================================================================//
+//=======================================================================//
 //                      FugsMultiTrackAudioEX.js                         //
 //=======================================================================//
 /*:
@@ -2842,16 +2842,29 @@
         try {
           buffer.play(true, 0);
 
-          // B28: if source node exists, stop the immediate start and re-schedule at startTime
-          if (buffer._sourceNode && typeof buffer._sourceNode.start === "function") {
+          // MV source nodes can only be started once. Schedule a fresh node and
+          // keep the original playing if creating the replacement fails.
+          if (buffer._sourceNode && buffer._gainNode) {
+            const originalSource = buffer._sourceNode;
+            let scheduledSource = null;
             try {
-              buffer._sourceNode.stop();
-            } catch (_stopErr) {
-              /* may not have started yet */
-            }
-            try {
-              buffer._sourceNode.start(startTime);
+              scheduledSource = WebAudio._context.createBufferSource();
+              scheduledSource.buffer = originalSource.buffer;
+              scheduledSource.loop = originalSource.loop;
+              scheduledSource.loopStart = originalSource.loopStart;
+              scheduledSource.loopEnd = originalSource.loopEnd;
+              scheduledSource.playbackRate.setValueAtTime(buffer._pitch || 1, startTime);
+              scheduledSource.connect(buffer._gainNode);
+              scheduledSource.start(startTime, 0);
+              buffer._sourceNode = scheduledSource;
+              buffer._startTime = startTime;
+              try { originalSource.stop(); } catch (_e) { /* already stopped */ }
+              try { originalSource.disconnect(); } catch (_e) { /* already disconnected */ }
             } catch (startErr) {
+              if (scheduledSource) {
+                try { scheduledSource.stop(); } catch (_e) { /* not started */ }
+                try { scheduledSource.disconnect(); } catch (_e) { /* not connected */ }
+              }
               Logger.warn(`syncPlay: Could not schedule ${key} at ${startTime}: ${startErr.message}`);
             }
           }
