@@ -2,8 +2,8 @@
 //                        FugsAudio4Dynamics.js                          //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Duck, sidechain, pump, pitchbendall for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Duck, sidechain, pump, pitchbendall for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help
@@ -138,19 +138,43 @@
 
   hub.ensurePumpNode = function(buffer) {
       if (!buffer || !buffer._gainNode || !buffer._pannerNode) return false;
-      if (buffer._pumpGainNode) return true;
       if (!WebAudio._context) return false;
+      // The engines create NEW gain/panner nodes every time a buffer (re)starts (repeat loops,
+      // resume, MZ pitch restarts). The pump node must follow them, so re-insert it whenever the
+      // nodes it was wired to are no longer the buffer's current ones.
+      if (
+        buffer._pumpGainNode &&
+        buffer._pumpWiredGain === buffer._gainNode &&
+        buffer._pumpWiredPanner === buffer._pannerNode
+      ) {
+        return true;
+      }
 
       try {
+        let level = 1.0;
+        if (buffer._pumpGainNode) {
+          try {
+            level = buffer._pumpGainNode.gain.value;
+          } catch (_) {
+            level = 1.0;
+          }
+          try {
+            buffer._pumpGainNode.disconnect();
+          } catch (_) {
+            /* already disconnected */
+          }
+        }
+
+        // Create pump gain node
         buffer._pumpGainNode = WebAudio._context.createGain();
-        buffer._pumpGainNode.gain.value = 1.0;
+        buffer._pumpGainNode.gain.value = level;
 
         const gain = buffer._gainNode;
         const panner = buffer._pannerNode;
         const sidechain = buffer._sidechainGainNode;
         const pump = buffer._pumpGainNode;
 
-        // B23: disconnect only the audibility edge, not every gain output (preserves analyser taps).
+        // Preserve the sidechain multiplier in the main path and leave analyser taps connected.
         if (sidechain) {
           try {
             sidechain.disconnect(panner);
@@ -170,6 +194,8 @@
         }
         pump.connect(panner);
         this._reconnectSidechainAnalyserTaps(buffer);
+        buffer._pumpWiredGain = gain;
+        buffer._pumpWiredPanner = panner;
 
         return true;
       } catch (e) {
@@ -293,6 +319,22 @@
       }
     };
 
+  // A sidechain endpoint may be given as a BGM track number ("1") or, as the Docs' examples do
+  // ("sidechain-bgm kick bass ..."), as the file name playing on a BGM track (case-insensitive).
+  // Either way the connection is keyed by track NUMBER so save/restore and teardown keep working.
+  hub._resolveBgmTrackId = function(ref) {
+      const raw = String(ref);
+      if (this.tracks.has(`bgm_${raw}`)) return raw;
+      const wanted = raw.toLowerCase();
+      for (const [key, buf] of this.tracks.entries()) {
+        if (!key.startsWith("bgm_")) continue;
+        if (buf && typeof buf._name === "string" && buf._name.toLowerCase() === wanted) {
+          return key.substring(4);
+        }
+      }
+      return raw;
+    };
+
   hub.setupSidechain = function(args) {
       try {
         if (!WebAudio._context) {
@@ -300,8 +342,8 @@
           return false;
         }
 
-        const sourceId = String(args[0]);
-        const targetId = String(args[1]);
+        const sourceId = this._resolveBgmTrackId(args[0]);
+        const targetId = this._resolveBgmTrackId(args[1]);
         const threshold = this.toNum(args[2], 0.5); // RMS threshold (0-1)
         // Clamp ratio >= 1 to prevent division by zero; attack/release >= 0.001 for coefficient math
         const ratio = Math.max(1.0, this.toNum(args[3], 4.0));
@@ -523,8 +565,8 @@
     };
 
   hub.stopSidechain = function(args) {
-      const sourceId = String(args[0]);
-      const targetId = String(args[1]);
+      const sourceId = this._resolveBgmTrackId(args[0]);
+      const targetId = this._resolveBgmTrackId(args[1]);
       const connectionKey = `${sourceId}_to_${targetId}`;
 
       const connection = this.sidechainConnections.get(connectionKey);
@@ -555,16 +597,20 @@
       // Otherwise, restore to current volume
       const restoreVolume = activeFade ? activeFade.targetValue : buffer.volume;
 
+      // duckLevel is a FRACTION of the track's own level (0.3 = 30% of what it is now), so a
+      // muted stem stays silent and a quiet track never gets louder when ducking starts.
+      const duckedVolume = restoreVolume * duckLevel;
+
       if (switchId && holdTime === 0) {
         // Switch-controlled ducking - duck immediately, restore when switch turns off
         Logger.info(
           `Starting switch-controlled duck for ${key}: ${Math.round(
             restoreVolume * 100
-          )}% -> ${duckLevel * 100}% (switch ${switchId})`
+          )}% -> ${Math.round(duckedVolume * 100)}% (switch ${switchId})`
         );
 
         this.fadeAudio(type, trackId, {
-          volume: duckLevel * 100,
+          volume: duckedVolume * 100,
           duration: fadeTime,
         });
 
@@ -591,7 +637,7 @@
         Logger.info(
           `Starting timed duck for ${key}: ${Math.round(
             restoreVolume * 100
-          )}% -> ${duckLevel * 100}% for ${holdTime}s`
+          )}% -> ${Math.round(duckedVolume * 100)}% for ${holdTime}s`
         );
 
         const duckGen = (buffer._duckGen || 0) + 1;

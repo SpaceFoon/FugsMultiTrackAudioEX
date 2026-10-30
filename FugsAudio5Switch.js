@@ -2,8 +2,8 @@
 //                        FugsAudio5Switch.js                            //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Switch-gated commands for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Switch-gated commands for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help

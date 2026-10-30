@@ -1,12 +1,15 @@
 # FugsMultiTrackAudioEX — Known Bugs
 
 **Source:** Core `FugsMultiTrackAudioEX.js` + satellites `FugsAudio2Effects` / `FugsAudio3Spatial` / `FugsAudio4Dynamics` / `FugsAudio5Switch` / `FugsAudio6Aliases`  
-**Last updated:** 2026-08-14  
+**Last updated:** 2026-10-30  
 **Status legend:** Open · Fixed · Confirmed in code · Fix not applied
 
 This file tracks confirmed defects found by code review. Severity reflects user impact under default or common setups.
 
-> **Status (2026-08-14):** **B01–B46** are fixed (spot-checked in source; `scripts/assert-bugs.js` locks B17–B46 fix claims and N01–N35 dismissals). No open bugs remain in this ledger. Items checked and dismissed live in **Not a bug (N01–N35)** — do not re-open them as bugs without new evidence.
+> **Status (2026-10-30):** B01–B46 are fixed (spot-checked in source; scripts/assert-bugs.js locks B17–B46 fix claims and N01–N35 dismissals). No open bugs remain in this ledger. Items checked and dismissed live in Not a bug (N01–N35) — do not re-open them as bugs without new evidence.
+
+> **Compatibility audit (v2.3, 2026-09-30):** Checked against MV 1.6, MZ 1.x, and real MZ 1.7.0 scripts. The audit found 20 further defects and fixed them with scenario coverage in scripts/tests/ and README Verification. Its original B17–B36 labels overlap different entries in the ledger below; this file keeps the existing B01–B46 numbering.
+
 
 ---
 
@@ -70,7 +73,7 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 
 **What was wrong:** Default `pauseMode: battle` paused tracks on battle enter, but battle exit never resumed them.
 
-**Fix:** Battle→map terminate now resumes `_pauseMode === "battle"` tracks (mirrors menu), then runs `handleSceneTransition("scene")`.
+**Fix:** Battle→map terminate now resumes `_pauseMode === "battle"` tracks (mirrors menu), then runs `handleSceneTransition("scene")`. *(Since B32 the battle→map hand-off uses its own `"afterBattle"` transition instead of `"scene"`.)*
 
 ---
 
@@ -248,7 +251,7 @@ This file tracks confirmed defects found by code review. Severity reflects user 
 
 ---
 
-### B17 — High: Load game leaves leftover session tracks playing — **Fixed 2026-08-14**
+### B17 — High: Load game leaves leftover session tracks playing — **Fixed 2026-10-30**
 
 **Where:** `DataManager.loadGame`, `handleSceneTransition`, `loadAllStates`
 
@@ -262,7 +265,7 @@ Same-key title/session tracks are usually replaced (`playAudio` → `stopAudio(0
 
 ---
 
-### B18 — High: `pauseMode: scene` never auto-resumes — **Fixed 2026-08-14**
+### B18 — High: `pauseMode: scene` never auto-resumes — **Fixed 2026-10-30**
 
 **Where:** `handleSceneTransition`, `Scene_Map.prototype.terminate` — missing resume on `Scene_Map.create` / `start`
 
@@ -276,7 +279,7 @@ Battle and menu have explicit resume paths; scene does not.
 
 ---
 
-### B19 — High: `pauseMode: menu` resumes in Item/Skill/Equip/Save — **Fixed 2026-08-14**
+### B19 — High: `pauseMode: menu` resumes in Item/Skill/Equip/Save — **Fixed 2026-10-30**
 
 **Where:** `Scene_Menu.prototype.start` / `terminate` only (not `Scene_MenuBase`)
 
@@ -290,7 +293,7 @@ Shop / Name from an **event** never touch `Scene_Menu`, so `(pause:menu)` does n
 
 ---
 
-### B20 — Medium: No `Scene_Gameover` hook — tracks keep playing — **Fixed 2026-08-14**
+### B20 — Medium: No `Scene_Gameover` hook — tracks keep playing — **Fixed 2026-10-30**
 
 **Where:** Scene hooks in core (Title is hooked; Gameover is not). `Scene_Map.terminate` / `Scene_Battle.terminate` also ignore Gameover as a next scene.
 
@@ -302,7 +305,7 @@ Shop / Name from an **event** never touch `Scene_Menu`, so `(pause:menu)` does n
 
 ---
 
-### B21 — Medium: Switch-gated commands are not in save data — **Fixed 2026-08-14**
+### B21 — Medium: Switch-gated commands are not in save data — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio5Switch.js` `SwitchBuffer` / `SwitchManager`; `getSaveData` / `applySaveData`
 
@@ -314,7 +317,7 @@ Shop / Name from an **event** never touch `Scene_Menu`, so `(pause:menu)` does n
 
 ---
 
-### B22 — Medium: Runtime SFX aliases are not in save data — **Fixed 2026-08-14**
+### B22 — Medium: Runtime SFX aliases are not in save data — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio6Aliases.js` `sfxAliases` / `aliasLastPlayed`; save hooks
 
@@ -326,7 +329,7 @@ Shop / Name from an **event** never touch `Scene_Menu`, so `(pause:menu)` does n
 
 ---
 
-### B23 — Medium: `ensurePumpNode` severs sidechain analyser taps — **Fixed 2026-08-14**
+### B23 — Medium: `ensurePumpNode` severs sidechain analyser taps — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio4Dynamics.js` `ensurePumpNode`
 
@@ -338,7 +341,7 @@ Shop / Name from an **event** never touch `Scene_Menu`, so `(pause:menu)` does n
 
 ---
 
-### B24 — Medium: Switch OFF only auto-stops `play` actions — **Fixed 2026-08-14**
+### B24 — Medium: Switch OFF only auto-stops `play` actions — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio5Switch.js` `stopSwitchCommands`
 
@@ -350,7 +353,7 @@ Shop / Name from an **event** never touch `Scene_Menu`, so `(pause:menu)` does n
 
 ---
 
-### B25 — High: New Game / title does not reset mixer + satellite runtime — **Fixed 2026-08-14**
+### B25 — High: New Game / title does not reset mixer + satellite runtime — **Fixed 2026-10-30**
 
 **Where:** `DataManager.setupNewGame`, `Scene_Title.prototype.start`
 
@@ -366,7 +369,7 @@ Shop / Name from an **event** never touch `Scene_Menu`, so `(pause:menu)` does n
 
 ---
 
-### B26 — Medium–High: Effect chain not connected on cold/unready buffers — **Fixed 2026-08-14**
+### B26 — Medium–High: Effect chain not connected on cold/unready buffers — **Fixed 2026-10-30**
 
 **Where:** `playAudio` (core), `applyEffect` / `connectEffectChain` (`FugsAudio2Effects.js`), `resumeAudio` recreate path, `loadTrackState`
 
@@ -382,7 +385,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 ---
 
-### B27 — Medium: Sidechain writes `_gainNode.gain` and fights volume/proximity/fades — **Fixed 2026-08-14**
+### B27 — Medium: Sidechain writes `_gainNode.gain` and fights volume/proximity/fades — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio4Dynamics.js` `processEnvelope` (`_gainNode.gain.setValueAtTime`), vs core `fadeAudio` / Spatial `updateProximityVolume` setting `buffer.volume`
 
@@ -394,7 +397,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 ---
 
-### B28 — Low: `syncPlay` computes a start time and never uses it — **Fixed 2026-08-14**
+### B28 — Low: `syncPlay` computes a start time and never uses it — **Fixed 2026-10-30**
 
 **Where:** `syncPlay` / `startSyncedBuffers`
 
@@ -406,7 +409,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 ---
 
-### B29 — Low: Dashless `syncplay` parses as type `all` — **Fixed 2026-08-14**
+### B29 — Low: Dashless `syncplay` parses as type `all` — **Fixed 2026-10-30**
 
 **Where:** `parseClassicSyntax` dashless branch, `syncPlay`
 
@@ -418,7 +421,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 ---
 
-### B30 — Low: Ready buffer with `_totalTime === 0` retries end-timer forever — **Fixed 2026-08-14**
+### B30 — Low: Ready buffer with `_totalTime === 0` retries end-timer forever — **Fixed 2026-10-30**
 
 **Where:** `_scheduleTrackEndAction`
 
@@ -430,7 +433,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 ---
 
-### B31 — Medium: Event-bound proximity is not map-local — **Fixed 2026-08-14**
+### B31 — Medium: Event-bound proximity is not map-local — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio3Spatial.js` `proximityData`; `Scene_Map.prototype.create` (clears error log only)
 
@@ -442,7 +445,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 ---
 
-### B32 — Medium: `duckall-sidechain` still hits paused tracks (B13 hole) — **Fixed 2026-08-14**
+### B32 — Medium: `duckall-sidechain` still hits paused tracks (B13 hole) — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio4Dynamics.js` `sidechainDuck`
 
@@ -454,7 +457,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 ---
 
-### B33 — Low–Medium: Pause cancels pending duck-hold restore — **Fixed 2026-08-14**
+### B33 — Low–Medium: Pause cancels pending duck-hold restore — **Fixed 2026-10-30**
 
 **Where:** `pauseAudio` (cancels `activeTimeouts` for the key), `duckVolume` timed hold (`setTimeout` restore, tracked in `activeTimeouts`)
 
@@ -466,7 +469,7 @@ Same race on resume-recreate and on save/load restore of a track that had an eff
 
 ---
 
-### B34 — High: Save/pause capture post-proximity `buffer.volume` (double attenuation) — **Fixed 2026-08-14**
+### B34 — High: Save/pause capture post-proximity `buffer.volume` (double attenuation) — **Fixed 2026-10-30**
 
 **Where:** `captureTrackState` (playing branch uses `buffer.volume` / `buffer.pan`), `pauseAudio` snapshot (`volume: buffer.volume`, `pan: buffer.pan`)
 
@@ -482,7 +485,7 @@ Pitch is fine (`_basePitch`, not doppler).
 
 ---
 
-### B35 — Medium: `cancelFade` drops `onComplete` — duck/fade sequencing dies — **Fixed 2026-08-14**
+### B35 — Medium: `cancelFade` drops `onComplete` — duck/fade sequencing dies — **Fixed 2026-10-30**
 
 **Where:** `FadeManager.startFade` (cancels existing fade on the same key), `FadeManager.cancelFade`, `duckVolume` (schedules restore in the fade `onComplete`)
 
@@ -494,7 +497,7 @@ Pitch is fine (`_basePitch`, not doppler).
 
 ---
 
-### B36 — Medium: Fade-in + proximity on a cold buffer skips the silent start — **Fixed 2026-08-14**
+### B36 — Medium: Fade-in + proximity on a cold buffer skips the silent start — **Fixed 2026-10-30**
 
 **Where:** `playAudio` (`volume = 0` when `fadein > 0`, but `_manualVolume` is the full target; fade waits on `addLoadListener`)
 
@@ -506,7 +509,7 @@ Pitch is fine (`_basePitch`, not doppler).
 
 ---
 
-### B37 — Medium: Global dry path bypasses insert effects — **Fixed 2026-08-14**
+### B37 — Medium: Global dry path bypasses insert effects — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio2Effects.js` `createEffectChain` tail: `chain.input.connect(chain.dryGain)` always, then series nodes only feed `wetGain`. `applyEffect` uses the first effect’s `wet` (or default **0.35**) as the **chain-wide** mix.
 
@@ -520,7 +523,7 @@ Per-effect `wet:` on a reverb in a preset only sets the *global* mix (`effects.f
 
 ---
 
-### B38 — Medium: Pause/stop clears *all* per-key timeouts — **Fixed 2026-08-14**
+### B38 — Medium: Pause/stop clears *all* per-key timeouts — **Fixed 2026-10-30**
 
 **Where:** `pauseAudio`, `stopAudio`, `cleanupTrack` (`activeTimeouts` for that key)
 
@@ -536,7 +539,7 @@ Per-effect `wet:` on a reverb in a preset only sets the *global* mix (`effects.f
 
 ---
 
-### B39 — Low: Delay times > 1s throw — **Fixed 2026-08-14**
+### B39 — Low: Delay times > 1s throw — **Fixed 2026-10-30**
 
 **Where:** `createEffectChain` `case "delay"`: `createDelay(effect.maxDelay || AUDIO_CONSTANTS.DEFAULT_DELAY_MAX)` (`1`), then `delayTime.value = effect.delay || 0.3`
 
@@ -548,7 +551,7 @@ Per-effect `wet:` on a reverb in a preset only sets the *global* mix (`effects.f
 
 ---
 
-### B40 — Medium: Positional fade curve is dead; `(curve:)` dropped on fadeall — **Fixed 2026-08-14**
+### B40 — Medium: Positional fade curve is dead; `(curve:)` dropped on fadeall — **Fixed 2026-10-30**
 
 **Where:** `checkCurve` (always defaults to `"smooth"`), `executeCommand` `fade` / `pitch` / `pan` (`parsedCurve || args[n]`), `fadeAllOfType` / `fadeAllAudio` (never read `commandObject.curve`)
 
@@ -566,7 +569,7 @@ Worse: `fade-bgm1 50 2 linear` treats `"linear"` as **pan** (`toNum("linear")` �
 
 ---
 
-### B41 — Low: Alias cooldown is consumed even if `playAudio` fails — **Fixed 2026-08-14**
+### B41 — Low: Alias cooldown is consumed even if `playAudio` fails — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio6Aliases.js` `playAlias`
 
@@ -578,7 +581,7 @@ Worse: `fade-bgm1 50 2 linear` treats `"linear"` as **pan** (`toNum("linear")` �
 
 ---
 
-### B42 — Medium: `duckpump` only ticks on `Scene_Map` — **Fixed 2026-08-14**
+### B42 — Medium: `duckpump` only ticks on `Scene_Map` — **Fixed 2026-10-30**
 
 **Where:** Core `Scene_Map.prototype.update` → `runUpdateHooks()`; `FugsAudio4Dynamics.js` `onUpdate` → `updatePump()`
 
@@ -594,7 +597,7 @@ Sidechain and pansweep are **not** this bug: they drive themselves with `request
 
 ---
 
-### B43 — Low: First `playAlias` blocked while `cooldown > performance.now()` — **Fixed 2026-08-14**
+### B43 — Low: First `playAlias` blocked while `cooldown > performance.now()` — **Fixed 2026-10-30**
 
 **Where:** `FugsAudio6Aliases.js` `playAlias`
 
@@ -606,7 +609,7 @@ Sidechain and pansweep are **not** this bug: they drive themselves with `request
 
 ---
 
-### B45 — Medium: Cold paused restore snapshots proximity volume — **Fixed 2026-08-14**
+### B45 — Medium: Cold paused restore snapshots proximity volume — **Fixed 2026-10-30**
 
 **Where:** `loadTrackState` → `_restorePausedTrack` (deferred pause) then `_runRestoreHooks`; `FugsAudio3Spatial.js` restore calls `updateProximityVolume`; `pauseAudio` snapshots `buffer.volume`
 
@@ -618,7 +621,7 @@ Sidechain and pansweep are **not** this bug: they drive themselves with `request
 
 ---
 
-### B46 — Medium: `syncPlay` ignores `(p:)` and `(pause:)` — **Fixed 2026-08-14**
+### B46 — Medium: `syncPlay` ignores `(p:)` and `(pause:)` — **Fixed 2026-10-30**
 
 **Where:** `executeCommand` `case "syncplay"`; `syncPlay`
 
@@ -703,13 +706,13 @@ Promoted out of the old risky list (now open bugs, not dismissed): `loadGame` le
 | 2026-08-13 | Verification pass: re-read current sources for B17–B39. Corrected B17 title-Continue overlap (same-key replace is safe), B26 cold-cache-only, B30 (not a 404 timer loop), B34 not a factory-default, B38 pause vs stop. B01–B16 fix sites still present. |
 | 2026-08-13 | Fifth pass: positional fade curve (**B40**), alias cooldown on failed play (**B41**), pump frozen off-map (**B42**). Re-checked old risky items; wrote **Not a bug N01–N32**. Expanded B19 (Shop/Name from events). |
 | 2026-08-13 | Sixth pass + claim tests: first-play alias cooldown (**B43**), cold paused+proximity snapshot (**B45**), syncPlay drops `(p:)`/`(pause:)` (**B46**). Dismissed menu+`persistence:none` (**N33**), MV volume slider (**N34**), chain-on-empty-slot (**N35**). `scripts/assert-bugs.js` locks B17–B46 and N01–N35. |
-| 2026-08-14 | Seventh pass: **B17–B46 fixed** across core + satellites. Ledger updated; `scripts/assert-bugs.js` inverted to assert fix presence (runtime + source regex). N01–N35 dismissals unchanged. |
+| 2026-10-30 | Seventh pass: **B17–B46 fixed** across core + satellites. Ledger updated; `scripts/assert-bugs.js` inverted to assert fix presence (runtime + source regex). N01–N35 dismissals unchanged. |
 
 ---
 
 ## Fix priority (suggested)
 
-**All items below are fixed as of 2026-08-14.** Retained for historical triage order.
+**All items below are fixed as of 2026-10-30.** Retained for historical triage order.
 
 1. **B17 / B25 / B34** — Load leftover tracks, New Game not resetting runtime, save/pause capturing proximity volume.
 2. **B18 / B19** — Pause-mode resume holes (scene never resumes; menu resumes in submenus / misses Shop).

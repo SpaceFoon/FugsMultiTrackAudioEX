@@ -2,8 +2,8 @@
 //                        FugsAudio3Spatial.js                           //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Proximity, Doppler, pan sweep for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Proximity, Doppler, pan sweep for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help

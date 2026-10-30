@@ -2,8 +2,8 @@
 //                        FugsAudio6Aliases.js                           //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 SFX alias pools + humanizer for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 SFX alias pools + humanizer for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help
@@ -86,7 +86,7 @@
       if (config.cooldown > 0 && this.aliasLastPlayed.has(aliasName)) {
         const lastPlayed = this.aliasLastPlayed.get(aliasName);
         const now = performance.now();
-        if (now - lastPlayed < config.cooldown) {
+        if (lastPlayed !== undefined && now - lastPlayed < config.cooldown) {
           Logger.info(
             `playAlias: ${aliasName} on cooldown (${Math.round(config.cooldown - (now - lastPlayed))}ms remaining)`
           );

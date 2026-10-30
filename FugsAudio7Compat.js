@@ -2,8 +2,8 @@
 //                        FugsAudio7Compat.js                            //
 //=======================================================================//
 /*:
- * @plugindesc v2.2 Compatibility patches for Fugs MultiTrack Audio
- * @target MV 1.63
+ * @plugindesc v2.3 Compatibility patches for Fugs MultiTrack Audio
+ * @target MZ
  * @author Fug
  *
  * @help
