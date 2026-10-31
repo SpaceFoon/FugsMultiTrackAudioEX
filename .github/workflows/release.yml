@@ -20,33 +20,45 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag_name: ${{ steps.v.outputs.tag_name }}
+      checkout_ref: ${{ steps.v.outputs.checkout_ref }}
     steps:
       - id: v
         env:
           EVENT_NAME: ${{ github.event_name }}
           DISPATCH_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
+          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$REF" != "refs/heads/main" ]; then
+              echo "::error::Run a manual release from the main branch."
+              exit 1
+            fi
             VER="${DISPATCH_VERSION#v}"
-            echo "version=${VER}" >> "$GITHUB_OUTPUT"
-            echo "tag_name=v${VER}" >> "$GITHUB_OUTPUT"
+            TAG="v${VER}"
+            CHECKOUT_REF="refs/heads/main"
           else
             TAG="$REF_NAME"
             VER="${TAG#v}"
-            echo "version=${VER}" >> "$GITHUB_OUTPUT"
-            echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+            CHECKOUT_REF="refs/tags/$TAG"
           fi
+          if [[ ! "$VER" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then
+            echo "::error::Version must use MAJOR.MINOR.PATCH."
+            exit 1
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${CHECKOUT_REF}" >> "$GITHUB_OUTPUT"
 
   release:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout plugin tag
+      - name: Checkout release source
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag_name }}
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
