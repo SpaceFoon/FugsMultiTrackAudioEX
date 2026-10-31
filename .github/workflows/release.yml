@@ -65,6 +65,15 @@ jobs:
         with:
           node-version: 22
 
+      - name: Check shared directory token
+        env:
+          DIRECTORY_TOKEN: ${{ secrets.FUGS_SITE_SYNC_TOKEN }}
+        run: |
+          if [ -z "$DIRECTORY_TOKEN" ]; then
+            echo "::error::Set FUGS_SITE_SYNC_TOKEN with write access to the shared plugin directory."
+            exit 1
+          fi
+
       - name: Build deterministic release archive
         id: package
         env:
