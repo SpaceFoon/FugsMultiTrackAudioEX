@@ -385,6 +385,39 @@ forEachBackend("stems and global commands", (b) => {
     assert.deepEqual(keys(env), [], "stopped by the last chain step");
   });
 
+  it("chain can start on an empty slot and bind subsequent actions to its new buffer", async () => {
+    const env = await boot(b);
+    await env.runCommand("chain-bgm1 wait 1; play Theme 90; wait 1; fade 50 1");
+    await env.advance(1500);
+    assert.ok(env.track("bgm_1"), "chain play created the empty slot");
+    await env.advance(2000);
+    near(gainOf(env, "bgm_1"), 0.5, 0.03, "later chain step changed its own buffer");
+  });
+
+  it("chain leaves an externally claimed empty slot untouched", async () => {
+    const env = await boot(b);
+    await env.runCommand("chain-bgm1 wait 2; play Theme 90; wait 1; fade 20 1");
+    await play(env, "play-bgm1 Bass 80");
+    const external = env.track("bgm_1");
+    await env.advance(4500);
+    assert.equal(env.track("bgm_1"), external);
+    near(gainOf(env, "bgm_1"), 0.8, 0.03, "external track not faded");
+  });
+
+  it("chain cancels when its created buffer is replaced", async () => {
+    const env = await boot(b);
+    await env.runCommand("chain-bgm1 play Theme 90; wait 2; fade 20 1");
+    await env.advance(500);
+    const original = env.track("bgm_1");
+    assert.ok(original);
+    await play(env, "play-bgm1 Bass 80");
+    const replacement = env.track("bgm_1");
+    assert.notEqual(replacement, original);
+    await env.advance(3000);
+    assert.equal(env.track("bgm_1"), replacement);
+    near(gainOf(env, "bgm_1"), 0.8, 0.03, "replacement not faded");
+  });
+
   it("pauseall-bgm / resumeall-bgm only touch BGM (Docs: pauseall-[Type] / resumeall-[Type])", async () => {
     const env = await boot(b);
     await play(env, "play-bgm1 Theme");
