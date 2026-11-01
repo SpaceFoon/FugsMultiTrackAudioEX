@@ -4792,10 +4792,9 @@
       const commands = chainString.split(";").map((cmd) => cmd.trim());
       let currentDelay = 0;
 
-      // Capture the specific buffer instance to prevent race conditions
-      // If the track is replaced (e.g. play-bgm1 called again) before the chain finishes,
-      // we want to stop executing the chain on the new track.
-      const originalBuffer = this.tracks.get(key);
+      // Allow a chain to create an initially empty slot, while still cancelling
+      // if another command claims or replaces that slot between chain steps.
+      let chainBuffer = this.tracks.get(key) || null;
 
       commands.forEach((command, _index) => {
         const parts = command.split(" ").map((part) => part.trim());
@@ -4810,9 +4809,8 @@
 
         // Schedule the command execution
         const timeoutId = setTimeout(() => {
-          // Check if track still exists AND is the same instance before executing chain command
           const currentBuffer = this.tracks.get(key);
-          if (!currentBuffer || currentBuffer !== originalBuffer) {
+          if (chainBuffer ? !currentBuffer || currentBuffer !== chainBuffer : !!currentBuffer) {
             Logger.warn(`Chain command cancelled - track ${key} no longer exists or was replaced`);
             return;
           }
@@ -4830,6 +4828,7 @@
           };
 
           this.executeCommand(commandObj);
+          if (!chainBuffer) chainBuffer = this.tracks.get(key) || null;
 
           // Remove timeout from tracking
           this._removeTrackedTimeout(key, timeoutId);
