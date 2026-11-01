@@ -191,11 +191,16 @@ The image copies the repo in at build time, so run `docker build` again after ch
 
 ### Releasing
 
+Before publishing a tag, run the full gate locally and package the exact version:
+
 ```bash
-docker run --rm -v "$PWD/release:/out" fugs-audio release 2.3.0
+node scripts/verify-all.js
+node scripts/package-release.js 2.4.0
 ```
 
-This runs the whole gate and, only if it passes, writes `release/FugsMultiTrackAudioEX-v2.3.0.zip`: the nine plugin files, the rebuilt all-in-one bundle, `LICENSE`, this README and an `INSTALL.txt`. It refuses to package when a plugin's `@plugindesc` version does not match (2.3.0 needs `v2.3`). The same sources always give the same zip bytes. Without Docker: `node scripts/verify-all.js && node scripts/package-release.js 2.3.0`. Uploading the zip (GitHub release, itch.io, your site) is a manual step.
+The package script writes the deterministic install ZIP with the nine plugin files, rebuilt bundle, `LICENSE`, this README and `INSTALL.txt`. It refuses a package when a plugin's `@plugindesc` version does not match. Then push the matching version tag (for example, `git push origin v2.4.0`). The release workflow publishes the ZIP and sends the tagged plugin files, hashes, and release URL to the shared plugin directory. The website reads the updated directory on page load; the LostAges sync command reads it when you run `plugin-sync.sh pull`.
+
+The release workflow does not run the verification gate, so run it locally before pushing the tag. It needs the `FUGS_SITE_SYNC_TOKEN` Actions secret with write access to `SpaceFoon/RPG-Maker-MV-MZ-plugins`. A manual workflow run is also available from the `main` branch; enter the same version and do not reuse an existing release tag.
 
 ### Engine scenarios (`scripts/harness`, `scripts/tests`)
 
