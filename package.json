@@ -1,0 +1,7 @@
+{
+  "name": "fugsmultitrackaudioex-readme",
+  "private": true,
+  "scripts": {
+    "readme": "node -e \"const fs=require('node:fs');const names=['README.md','README.MD','README','readme.md','readme'];const name=names.find(fs.existsSync);if(!name){console.error('No root README found.');process.exitCode=1}else{process.stdout.write(fs.readFileSync(name,'utf8'))}\""
+  }
+}
